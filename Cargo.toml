@@ -1,0 +1,8 @@
+[package]
+name = "ipv6addr"
+version = "1.0.0"
+edition = "2024"
+
+[dependencies]
+itertools = "0.15.0"
+smallvec = "1.16.1"
