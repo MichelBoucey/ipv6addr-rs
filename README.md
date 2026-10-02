@@ -2,5 +2,5 @@
 
 The port of [the Haskell library](https://github.com/MichelBoucey/IPv6Addr) to deal with IPv6 address text representations, canonization and manipulations.
 
-You can try/use `IPv6Addr` with the Haskell CLI tool [ip6addr]( https://hackage.haskell.org/package/ip6addr ).
+You can try/use `ipv6addr` with the Haskell CLI tool [ip6addr]( https://hackage.haskell.org/package/ip6addr ).
 
