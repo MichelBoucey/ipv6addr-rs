@@ -2,5 +2,7 @@
 
 `ipv6addr` is a `Rust library` (ported from [the Haskell library IPv6Addr](https://github.com/MichelBoucey/IPv6Addr)) to deal with IPv6 address text representations, canonization and manipulations.
 
+[Full documentation](https://docs.rs/ip6addr/latest/ip6addr/)
+
 You can try/use `ipv6addr` through the CLI tool [ip6addr]( https://hackage.haskell.org/package/ip6addr ).
 
