@@ -31,11 +31,54 @@ pub(crate) fn ipv6_token_to_text(token: &Ipv6AddrToken) -> &str {
     }
 }
 
+/// Returns `true` when the text is the content of a valid
+/// [`Ipv6AddrToken::SixteenBit`]: 1 to 4 hexadecimal digits.
+///
+/// This is the single definition of the `SixteenBit` invariant. Every
+/// function of the library that emits a `SixteenBit` token goes through it,
+/// so that an emitted token always holds 1 to 4 hexadecimal digits.
+pub(crate) fn is_sixteen_bit(text: &str) -> bool {
+    (1..=4).contains(&text.len()) && text.bytes().all(is_hex_byte)
+}
+
+/// Builds the canonized chunk token of an hexadecimal text, or `None`.
+///
+/// The text has to be 1 to 4 hexadecimal digits: leading zeros are then
+/// suppressed and the digits lowercased (RFC 5952 4.1 and 4.3), an all
+/// zeros text yielding an [`Ipv6AddrToken::AllZeros`] token.
+pub(crate) fn canonized_sixteen_bit(text: &str) -> Option<Ipv6AddrToken> {
+    if !is_sixteen_bit(text) {
+        return None;
+    }
+    let lower = text.to_ascii_lowercase();
+    let trimmed = lower.trim_start_matches('0');
+    Some(if trimmed.is_empty() {
+        Ipv6AddrToken::AllZeros
+    } else {
+        Ipv6AddrToken::SixteenBit(trimmed.to_owned())
+    })
+}
+
+/// Builds a [`Ipv6AddrToken::SixteenBit`] from a text already known to be 1
+/// to 4 hexadecimal digits.
+pub(crate) fn valid_sixteen_bit(text: impl Into<String>) -> Ipv6AddrToken {
+    let text = text.into();
+    debug_assert!(is_sixteen_bit(&text));
+    Ipv6AddrToken::SixteenBit(text)
+}
+
 /// Returns `true` if a list of IPv6 address tokens constitutes a valid
 /// IPv6 address.
 pub(crate) fn is_ipv6_addr(tks: &Ipv6AddrTokens) -> bool {
     // [] -> False
     if tks.is_empty() {
+        return false;
+    }
+    // A SixteenBit token must hold 1 to 4 hexadecimal digits.
+    if !tks.iter().all(|t| match t {
+        Ipv6AddrToken::SixteenBit(s) => is_sixteen_bit(s),
+        _ => true,
+    }) {
         return false;
     }
     // [DoubleColon] -> True
@@ -312,9 +355,9 @@ pub(crate) fn ipv4_addr_to_ipv6_addr_tokens(t: &Ipv6AddrToken) -> Ipv6AddrTokens
             let n1 = hex_digits_of(groups.next());
             let n2 = hex_digits_of(groups.next());
             let n3 = hex_digits_of(groups.next());
-            out.push(Ipv6AddrToken::SixteenBit(n0 + &add_zero(&n1)));
+            out.push(valid_sixteen_bit(n0 + &add_zero(&n1)));
             out.push(Ipv6AddrToken::Colon);
-            out.push(Ipv6AddrToken::SixteenBit(n2 + &add_zero(&n3)));
+            out.push(valid_sixteen_bit(n2 + &add_zero(&n3)));
             out
         }
         other => {
@@ -347,8 +390,8 @@ fn add_zero(d: &str) -> String {
 pub(crate) fn expand_tokens(tks: &Ipv6AddrTokens) -> Ipv6AddrTokens {
     tks.iter()
         .map(|t| match t {
-            Ipv6AddrToken::SixteenBit(s) => Ipv6AddrToken::SixteenBit(pad_left_4(s)),
-            Ipv6AddrToken::AllZeros => Ipv6AddrToken::SixteenBit(String::from("0000")),
+            Ipv6AddrToken::SixteenBit(s) => valid_sixteen_bit(pad_left_4(s)),
+            Ipv6AddrToken::AllZeros => valid_sixteen_bit("0000"),
             other => other.clone(),
         })
         .collect()
@@ -541,13 +584,7 @@ fn parse_sixteen_bit(input: &str) -> Option<(Ipv6AddrToken, &str)> {
     if n == 0 {
         return None;
     }
-    let lower = input[..n].to_ascii_lowercase();
-    let trimmed = lower.trim_start_matches('0');
-    let token = if trimmed.is_empty() {
-        Ipv6AddrToken::AllZeros
-    } else {
-        Ipv6AddrToken::SixteenBit(trimmed.to_owned())
-    };
+    let token = canonized_sixteen_bit(&input[..n])?;
     Some((token, &input[n..]))
 }
 
@@ -846,6 +883,69 @@ mod tests {
         assert_eq!(hex_text_to_int("0"), 0);
         assert_eq!(hex_text_to_int("beef"), 0xbeef);
         assert_eq!(hex_text_to_int("CAFE"), 0xcafe);
+    }
+
+    #[test]
+    fn is_sixteen_bit_accepts_one_to_four_hexadecimal_digits() {
+        for text in ["0", "1", "a", "F", "00", "0a", "ffff", "ABCD", "0000"] {
+            assert!(
+                is_sixteen_bit(text),
+                "{text:?} is 1 to 4 hexadecimal digits"
+            );
+        }
+        for text in ["", "00000", "g", "12g4", " 1", "1 ", "-1", "ab\n"] {
+            assert!(
+                !is_sixteen_bit(text),
+                "{text:?} is not 1 to 4 hexadecimal digits"
+            );
+        }
+    }
+
+    #[test]
+    fn canonized_sixteen_bit_drops_leading_zeroes_and_lowercases() {
+        assert_eq!(canonized_sixteen_bit("0000"), Some(Ipv6AddrToken::AllZeros));
+        assert_eq!(
+            canonized_sixteen_bit("0f00"),
+            Some(Ipv6AddrToken::SixteenBit(String::from("f00")))
+        );
+        assert_eq!(
+            canonized_sixteen_bit("ABCD"),
+            Some(Ipv6AddrToken::SixteenBit(String::from("abcd")))
+        );
+        assert_eq!(
+            canonized_sixteen_bit("ffff"),
+            Some(Ipv6AddrToken::SixteenBit(String::from("ffff")))
+        );
+        assert_eq!(canonized_sixteen_bit(""), None);
+        assert_eq!(canonized_sixteen_bit("00000"), None);
+        assert_eq!(canonized_sixteen_bit("zzzz"), None);
+    }
+
+    #[test]
+    fn valid_sixteen_bit_builds_an_hexadecimal_chunk() {
+        assert_eq!(
+            valid_sixteen_bit("beef"),
+            Ipv6AddrToken::SixteenBit(String::from("beef"))
+        );
+    }
+
+    #[test]
+    fn is_ipv6_addr_rejects_a_malformed_sixteen_bit_content() {
+        let mut tks = Ipv6AddrTokens::new();
+        tks.push(Ipv6AddrToken::SixteenBit(String::from("1")));
+        tks.push(Ipv6AddrToken::Colon);
+        tks.push(Ipv6AddrToken::SixteenBit(String::from("zzzz")));
+        tks.push(Ipv6AddrToken::Colon);
+        tks.push(Ipv6AddrToken::SixteenBit(String::from("2")));
+        tks.push(Ipv6AddrToken::Colon);
+        tks.push(Ipv6AddrToken::SixteenBit(String::from("3")));
+        tks.push(Ipv6AddrToken::Colon);
+        tks.push(Ipv6AddrToken::SixteenBit(String::from("4")));
+        tks.push(Ipv6AddrToken::Colon);
+        tks.push(Ipv6AddrToken::SixteenBit(String::from("5")));
+        tks.push(Ipv6AddrToken::Colon);
+        tks.push(Ipv6AddrToken::SixteenBit(String::from("6")));
+        assert!(!is_ipv6_addr(&tks));
     }
 
     #[test]

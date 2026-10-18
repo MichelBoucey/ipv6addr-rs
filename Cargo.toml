@@ -1,6 +1,6 @@
 [package]
 name = "ipv6addr"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 authors = ["Michel Boucey <michel.boucey@gmail.com>"]
 license = "BSD-3-Clause"
