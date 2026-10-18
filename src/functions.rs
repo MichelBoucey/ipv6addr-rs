@@ -6,9 +6,9 @@
 //! standing in for the `Maybe` monad.
 
 use crate::internals::{
-    expand_tokens, from_double_colon, ipv6_addr_tokens, ipv6_tokens_to_ipv6_addr,
-    ipv6_tokens_to_text, is_ipv6_addr, mac_addr, to_double_colon, tok_ipv6_addr,
-    tok_pure_ipv6_addr, tokens_to_ipv6,
+    canonized_sixteen_bit, expand_tokens, from_double_colon, ipv6_addr_tokens,
+    ipv6_tokens_to_ipv6_addr, ipv6_tokens_to_text, is_ipv6_addr, mac_addr, to_double_colon,
+    tok_ipv6_addr, tok_pure_ipv6_addr, tokens_to_ipv6, valid_sixteen_bit,
 };
 use crate::types::{Ipv6Addr, Ipv6AddrToken, Ipv6AddrTokens};
 
@@ -178,33 +178,41 @@ fn rand_partial_ipv6_addr_with(rng: &mut XorShift64Star, n: usize) -> Ipv6AddrTo
     if n == 0 || n > 8 {
         return Ipv6AddrTokens::new();
     }
-    let chunks = (0..n).map(|_| Ipv6AddrToken::SixteenBit(random_hex(rng, 4)));
+    let chunks = (0..n).map(|_| valid_sixteen_bit(random_hex(rng, 4)));
     itertools::Itertools::intersperse(chunks, Ipv6AddrToken::Colon).collect()
 }
 
-/// Returns a random 16-Bit chunk built from a mask: each '_' is replaced by
-/// a random hexadecimal digit, the other characters are kept as-is, then
-/// the leading zeroes are dropped.
+/// Returns `Some` of a random 16-Bit chunk built from a mask, or `None` when
+/// the mask is not four characters, each being an hexadecimal digit or the
+/// '_' placeholder.
+///
+/// Each '_' is replaced by a random hexadecimal digit, then the leading
+/// zeroes are dropped, so that the emitted token is a `SixteenBit` of 1 to 4
+/// hexadecimal digits, or an `AllZeros` token.
 ///
 /// > rand_ipv6_addr_chunk("_f__") is a `SixteenBit` made of a random digit,
 /// >   an "f" and two random digits.
-pub fn rand_ipv6_addr_chunk(mask: &str) -> Ipv6AddrToken {
+pub fn rand_ipv6_addr_chunk(mask: &str) -> Option<Ipv6AddrToken> {
     rand_ipv6_addr_chunk_with(&mut XorShift64Star::from_system_seed(), mask)
 }
 
 /// The seeded core of [`rand_ipv6_addr_chunk`].
-fn rand_ipv6_addr_chunk_with(rng: &mut XorShift64Star, mask: &str) -> Ipv6AddrToken {
-    let built: String = mask
-        .chars()
-        .map(|c| {
-            if c == '_' {
+fn rand_ipv6_addr_chunk_with(rng: &mut XorShift64Star, mask: &str) -> Option<Ipv6AddrToken> {
+    let bytes = mask.as_bytes();
+    if bytes.len() != 4 || !bytes.iter().all(|&b| b.is_ascii_hexdigit() || b == b'_') {
+        return None;
+    }
+    let built: String = bytes
+        .iter()
+        .map(|&b| {
+            if b == b'_' {
                 hex_digit_char(rng.next_hex_digit())
             } else {
-                c
+                b as char
             }
         })
         .collect();
-    Ipv6AddrToken::SixteenBit(built.trim_start_matches('0').to_owned())
+    canonized_sixteen_bit(&built)
 }
 
 /// Returns a random IPv6 address, an embedded IPv4 address being always
@@ -436,12 +444,87 @@ mod tests {
     fn a_masked_chunk_is_a_16_bit_chunk() {
         let mut rng = XorShift64Star::with_seed(11);
         match rand_ipv6_addr_chunk_with(&mut rng, "_f__") {
-            Ipv6AddrToken::SixteenBit(chunk) => {
+            Some(Ipv6AddrToken::SixteenBit(chunk)) => {
                 assert!(chunk.contains('f'));
                 assert!(chunk.len() <= 4);
                 assert!(chunk.chars().all(|c| c.is_ascii_hexdigit()));
             }
             _ => panic!("a masked chunk is always a 16-Bit chunk"),
+        }
+    }
+
+    /// Asserts that a token emitted as a chunk is a valid one: a `SixteenBit`
+    /// of 1 to 4 lowercase hexadecimal digits, or an `AllZeros` token.
+    fn assert_valid_chunk(token: &Ipv6AddrToken) {
+        match token {
+            Ipv6AddrToken::SixteenBit(s) => {
+                assert!(
+                    !s.is_empty() && s.len() <= 4,
+                    "chunk {s:?} is 1 to 4 digits"
+                );
+                assert!(
+                    s.chars().all(|c| c.is_ascii_hexdigit()),
+                    "chunk {s:?} is hexadecimal"
+                );
+                assert_eq!(s, &s.to_ascii_lowercase(), "chunk {s:?} is lowercase");
+            }
+            Ipv6AddrToken::AllZeros => {}
+            other => panic!("a masked chunk is a chunk token, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_mask_of_underscores_is_accepted() {
+        for seed in 0..64 {
+            let mut rng = XorShift64Star::with_seed(seed);
+            let token = rand_ipv6_addr_chunk_with(&mut rng, "____")
+                .unwrap_or_else(|| panic!("a mask of underscores is valid (seed {seed})"));
+            assert_valid_chunk(&token);
+        }
+    }
+
+    #[test]
+    fn an_all_zero_mask_yields_an_all_zeros_chunk() {
+        let mut rng = XorShift64Star::with_seed(13);
+        assert_eq!(
+            rand_ipv6_addr_chunk_with(&mut rng, "0000"),
+            Some(Ipv6AddrToken::AllZeros)
+        );
+    }
+
+    #[test]
+    fn a_masked_chunk_is_lowercased() {
+        let mut rng = XorShift64Star::with_seed(17);
+        match rand_ipv6_addr_chunk_with(&mut rng, "AB__") {
+            Some(Ipv6AddrToken::SixteenBit(chunk)) => {
+                assert!(chunk.starts_with("ab"));
+            }
+            other => panic!("an uppercase masked chunk is lowercased, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_invalid_mask_returns_none() {
+        let mut rng = XorShift64Star::with_seed(19);
+        for mask in ["", "abc", "abcde", "___", "zzzz", "ab_g", "1:2:3"] {
+            assert_eq!(
+                rand_ipv6_addr_chunk_with(&mut rng, mask),
+                None,
+                "mask {mask:?} is invalid"
+            );
+        }
+    }
+
+    #[test]
+    fn every_masked_chunk_respects_the_16_bit_invariant() {
+        for seed in 0..32 {
+            let mut rng = XorShift64Star::with_seed(seed);
+            for mask in ["____", "_f__", "f___", "__f_", "0f__", "00__", "ffff"] {
+                match rand_ipv6_addr_chunk_with(&mut rng, mask) {
+                    Some(token) => assert_valid_chunk(&token),
+                    None => panic!("mask {mask:?} is valid (seed {seed})"),
+                }
+            }
         }
     }
 
