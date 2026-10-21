@@ -10,6 +10,7 @@ description = "A library to deal with IPv6 address text representations, canoniz
 homepage = "https://github.com/MichelBoucey/ipv6addr-rs"
 repository = "https://github.com/MichelBoucey/ipv6addr-rs"
 readme = "README.md"
+rust-version = "1.85.1"
 
 [dependencies]
 itertools = "0.15.0"
