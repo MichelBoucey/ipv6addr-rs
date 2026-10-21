@@ -52,6 +52,42 @@ impl From<&str> for Ipv6Addr {
     }
 }
 
+/// Converts a `std::net::Ipv6Addr` into its canonical text representation
+/// (RFC 5952).
+///
+/// The IPv4-mapped addresses keep their IPv4 text representation, as
+/// `std::net::Ipv6Addr` renders them:
+///
+/// > Ipv6Addr::from(std::net::Ipv6Addr::new(0, 0, 0, 0, 0, 0xffff, 0xc000, 0x0280))
+/// >   == Ipv6Addr("::ffff:192.0.2.128")
+impl From<std::net::Ipv6Addr> for Ipv6Addr {
+    fn from(addr: std::net::Ipv6Addr) -> Self {
+        Ipv6Addr(addr.to_string())
+    }
+}
+
+/// Converts an IPv6 address into its `std::net::Ipv6Addr` counterpart.
+///
+/// An embedded IPv4 address is always resolved to hexadecimal digits:
+///
+/// > let net_addr: std::net::Ipv6Addr = Ipv6Addr::from("::ffff:192.0.2.128").into();
+/// > net_addr == std::net::Ipv6Addr::new(0, 0, 0, 0, 0, 0xffff, 0xc000, 0x0280)
+///
+/// # Panics
+///
+/// Panics when the wrapped text is not a valid IPv6 address: an
+/// [`Ipv6Addr`] is a text wrapper that can hold any text. Use
+/// [`to_std_ipv6_addr`](crate::to_std_ipv6_addr) to handle that case
+/// without panicking.
+impl From<Ipv6Addr> for std::net::Ipv6Addr {
+    fn from(addr: Ipv6Addr) -> Self {
+        match crate::internals::ipv6_addr_to_std(&addr) {
+            Some(net_addr) => net_addr,
+            None => panic!("{addr} is not a valid IPv6 address"),
+        }
+    }
+}
+
 /// A token of an IPv6 address textual representation.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Ipv6AddrToken {
@@ -129,5 +165,39 @@ mod tests {
             Ipv6Addr::from("not an address"),
             Ipv6Addr::from("not another")
         );
+    }
+
+    #[test]
+    fn a_std_ipv6_addr_is_converted_into_its_canonical_text() {
+        assert_eq!(
+            Ipv6Addr::from(std::net::Ipv6Addr::new(
+                0, 0, 0, 0, 0, 0xffff, 0xc000, 0x0280
+            )),
+            Ipv6Addr::from("::ffff:192.0.2.128")
+        );
+        assert_eq!(
+            Ipv6Addr::from(std::net::Ipv6Addr::LOCALHOST),
+            Ipv6Addr::from("::1")
+        );
+    }
+
+    #[test]
+    fn an_ipv6_addr_is_converted_into_a_std_ipv6_addr() {
+        let net_addr: std::net::Ipv6Addr = Ipv6Addr::from("::ffff:192.0.2.128").into();
+        assert_eq!(
+            net_addr,
+            std::net::Ipv6Addr::new(0, 0, 0, 0, 0, 0xffff, 0xc000, 0x0280)
+        );
+        let net_addr: std::net::Ipv6Addr = Ipv6Addr::from("2001:db8::1").into();
+        assert_eq!(
+            net_addr,
+            std::net::Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "is not a valid IPv6 address")]
+    fn an_unparsable_ipv6_addr_panics_when_converted_into_a_std_ipv6_addr() {
+        let _: std::net::Ipv6Addr = Ipv6Addr::from("not an address").into();
     }
 }
