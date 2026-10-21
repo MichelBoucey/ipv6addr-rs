@@ -1,6 +1,6 @@
 # ipv6addr [![CI](https://github.com/MichelBoucey/ipv6addr-rs/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/MichelBoucey/ipv6addr-rs/actions/workflows/ci.yml)
 
-`ipv6addr` is a `Rust library` (ported from [the Haskell library IPv6Addr](https://github.com/MichelBoucey/IPv6Addr)) to deal with IPv6 address text representations, canonization and manipulations. See the [full documentation](https://docs.rs/ipv6addr/latest/ipv6addr/).
+`ipv6addr` is a `Rust library` (ported from [the Haskell library IPv6Addr](https://github.com/MichelBoucey/IPv6Addr)) to deal with IPv6 address textual representations, canonization and manipulations. See the [full documentation](https://docs.rs/ipv6addr/latest/ipv6addr/).
 
 * Canonical IPv6 address, in conformation with [RFC 5952](https://www.rfc-editor.org/rfc/rfc5952)
 * Pure IPv6 address, *i.e.* force the rewriting of IPv4 address if present
