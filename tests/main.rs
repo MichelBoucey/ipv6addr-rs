@@ -6,13 +6,12 @@
 //! `toIPv6`), the assertions compare by address value: the canonical
 //! `Ipv6Addr` equality.
 //!
-//! The suite does not cover `toHostName`, `toIPv6`, the JSON instances or
-//! the OS network-interfaces functions, none of which are part of this
-//! port.
+//! The suite does not cover `toHostName`, the JSON instances or the OS
+//! network-interfaces functions, none of which are part of this port.
 
 use ipv6addr::{
-    Ipv6Addr, Ipv6AddrToken, Ipv6AddrTokens, full_ipv6_addr, ipv6_addr,
-    mac_addr_to_ipv6_addr_tokens, pure_ipv6_addr, to_ip6_arpa, to_unc,
+    Ipv6Addr, Ipv6AddrToken, Ipv6AddrTokens, from_std_ipv6_addr, full_ipv6_addr, ipv6_addr,
+    mac_addr_to_ipv6_addr_tokens, pure_ipv6_addr, to_ip6_arpa, to_std_ipv6_addr, to_unc,
 };
 
 /// Asserts `ipv6_addr` on one input, by address value.
@@ -299,4 +298,36 @@ fn mac_addr_to_ipv6_addr_tokens_splits_the_three_16_bit_chunks() {
         mac_addr_to_ipv6_addr_tokens("fa:1d:58:cc:95:16"),
         Some(expected)
     );
+}
+
+#[test]
+fn std_ipv6_addr_conversions_round_trip() {
+    for (text, expected) in [
+        ("::", std::net::Ipv6Addr::UNSPECIFIED),
+        ("::1", std::net::Ipv6Addr::LOCALHOST),
+        (
+            "2001:db8::1",
+            std::net::Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1),
+        ),
+        (
+            "::ffff:192.0.2.128",
+            std::net::Ipv6Addr::new(0, 0, 0, 0, 0, 0xffff, 0xc000, 0x0280),
+        ),
+    ] {
+        assert_eq!(
+            to_std_ipv6_addr(&Ipv6Addr::from(text)),
+            Some(expected),
+            "to_std_ipv6_addr {text:?}"
+        );
+        assert_eq!(
+            from_std_ipv6_addr(expected),
+            Ipv6Addr::from(text),
+            "from_std_ipv6_addr {text:?}"
+        );
+    }
+}
+
+#[test]
+fn a_std_ipv6_addr_conversion_returns_none_for_a_garbage_addr() {
+    assert_eq!(to_std_ipv6_addr(&Ipv6Addr::from("no address")), None);
 }

@@ -7,6 +7,7 @@
 * IPv6 address full length
 * Reverse lookup domain name `IP6.ARPA.` address, in conformation with [RFC 3596 Section 2.5](https://www.rfc-editor.org/rfc/rfc3596#section-2.5)
 * IPv6 address conversion to `Windows UNC path name`
+* IPv6 address conversion to and from the core Rust library `std::net::Ipv6Addr`
 * IPv6 address random generation for test purpose
 
 *P.S.* : You can try/use `ipv6addr` through the CLI tool [ip6addr]( https://hackage.haskell.org/package/ip6addr ).

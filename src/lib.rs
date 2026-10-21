@@ -9,8 +9,9 @@ pub(crate) mod internals;
 mod functions;
 
 pub use functions::{
-    full_ipv6_addr, ipv6_addr, mac_addr_to_ipv6_addr_tokens, pure_ipv6_addr, rand_ipv6_addr,
-    rand_ipv6_addr_chunk, rand_ipv6_addr_with_prefix, rand_partial_ipv6_addr, to_ip6_arpa, to_unc,
+    from_std_ipv6_addr, full_ipv6_addr, ipv6_addr, mac_addr_to_ipv6_addr_tokens, pure_ipv6_addr,
+    rand_ipv6_addr, rand_ipv6_addr_chunk, rand_ipv6_addr_with_prefix, rand_partial_ipv6_addr,
+    to_ip6_arpa, to_std_ipv6_addr, to_unc,
 };
 
 pub use types::{Ipv6Addr, Ipv6AddrToken, Ipv6AddrTokens};

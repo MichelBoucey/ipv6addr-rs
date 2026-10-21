@@ -542,6 +542,16 @@ pub(crate) fn tokens_to_ipv6(tks: &Ipv6AddrTokens) -> Option<std::net::Ipv6Addr>
     Some(std::net::Ipv6Addr::from(segments))
 }
 
+/// Converts the text of an IPv6 address into a `std::net::Ipv6Addr`, or
+/// returns `None` when the text is not a valid IPv6 address.
+///
+/// An embedded IPv4 address is always rewritten as hexadecimal digits
+/// before the conversion.
+pub(crate) fn ipv6_addr_to_std(addr: &Ipv6Addr) -> Option<std::net::Ipv6Addr> {
+    let tks = tok_pure_ipv6_addr(&addr.0)?;
+    tokens_to_ipv6(&tks)
+}
+
 // NOTE: `networkInterfacesIPv6AddrList` (getting the IPv6 addresses of the
 // local network interfaces) is not portable: it relies on OS-specific
 // network interfaces information. It is left out of this port.

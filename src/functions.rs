@@ -6,7 +6,7 @@
 //! standing in for the `Maybe` monad.
 
 use crate::internals::{
-    canonized_sixteen_bit, expand_tokens, from_double_colon, ipv6_addr_tokens,
+    canonized_sixteen_bit, expand_tokens, from_double_colon, ipv6_addr_to_std, ipv6_addr_tokens,
     ipv6_tokens_to_ipv6_addr, ipv6_tokens_to_text, is_ipv6_addr, mac_addr, to_double_colon,
     tok_ipv6_addr, tok_pure_ipv6_addr, tokens_to_ipv6, valid_sixteen_bit,
 };
@@ -47,6 +47,34 @@ pub fn full_ipv6_addr(text: &str) -> Option<Ipv6Addr> {
     let tks = from_double_colon(&tks);
     let tks = expand_tokens(&tks);
     ipv6_tokens_to_ipv6_addr(&tks)
+}
+
+/// Returns `Some` of the `std::net::Ipv6Addr` corresponding to the given
+/// IPv6 address, or `None` when the wrapped text is not a valid IPv6
+/// address.
+///
+/// An embedded IPv4 address is always resolved to hexadecimal digits:
+///
+/// > to_std_ipv6_addr(&Ipv6Addr::from("::ffff:192.0.2.128")) ==
+/// >   Some(std::net::Ipv6Addr::new(0, 0, 0, 0, 0, 0xffff, 0xc000, 0x0280))
+///
+/// The infallible counterpart is the `From` implementation:
+///
+/// > let net_addr: std::net::Ipv6Addr = Ipv6Addr::from("::ffff:192.0.2.128").into();
+pub fn to_std_ipv6_addr(addr: &Ipv6Addr) -> Option<std::net::Ipv6Addr> {
+    ipv6_addr_to_std(addr)
+}
+
+/// Returns the canonical text representation of the given
+/// `std::net::Ipv6Addr`, in conformation with RFC 5952.
+///
+/// The IPv4-mapped addresses keep their IPv4 text representation, as
+/// `std::net::Ipv6Addr` renders them:
+///
+/// > from_std_ipv6_addr(std::net::Ipv6Addr::new(0, 0, 0, 0, 0, 0xffff, 0xc000, 0x0280))
+/// >   == Ipv6Addr("::ffff:192.0.2.128")
+pub fn from_std_ipv6_addr(addr: std::net::Ipv6Addr) -> Ipv6Addr {
+    Ipv6Addr::from(addr)
 }
 
 /// Returns the reverse lookup domain name corresponding to the given IPv6
@@ -361,6 +389,59 @@ mod tests {
         assert_eq!(ipv6_addr("1.2.3"), None);
         assert_eq!(pure_ipv6_addr(""), None);
         assert_eq!(full_ipv6_addr("0:0:0"), None);
+    }
+
+    #[test]
+    fn converts_a_std_ipv6_addr_into_its_canonical_text() {
+        assert_eq!(
+            from_std_ipv6_addr(std::net::Ipv6Addr::new(
+                0, 0, 0, 0, 0, 0xffff, 0xc000, 0x0280
+            )),
+            Ipv6Addr::from("::ffff:192.0.2.128")
+        );
+        assert_eq!(
+            from_std_ipv6_addr(std::net::Ipv6Addr::LOCALHOST),
+            Ipv6Addr::from("::1")
+        );
+    }
+
+    #[test]
+    fn converts_an_ipv6_addr_into_a_std_ipv6_addr() {
+        assert_eq!(
+            to_std_ipv6_addr(&Ipv6Addr::from("::ffff:192.0.2.128")),
+            Some(std::net::Ipv6Addr::new(
+                0, 0, 0, 0, 0, 0xffff, 0xc000, 0x0280
+            ))
+        );
+        // An embedded IPv4 address is resolved to hexadecimal digits.
+        assert_eq!(
+            to_std_ipv6_addr(&Ipv6Addr::from("::1.2.3.4")),
+            Some(std::net::Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0x0102, 0x0304))
+        );
+    }
+
+    #[test]
+    fn std_ipv6_addr_conversions_round_trip() {
+        for text in [
+            "::",
+            "::1",
+            "2001:db8::1",
+            "::ffff:192.0.2.128",
+            "fe80::5efe:102:304",
+        ] {
+            let net_addr =
+                to_std_ipv6_addr(&Ipv6Addr::from(text)).expect("the text is an IPv6 address");
+            assert_eq!(
+                to_std_ipv6_addr(&from_std_ipv6_addr(net_addr)),
+                Some(net_addr),
+                "round trip of {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_std_ipv6_addr_conversion_returns_none_for_a_garbage_addr() {
+        assert_eq!(to_std_ipv6_addr(&Ipv6Addr::from("no address")), None);
     }
 
     #[test]
