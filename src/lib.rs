@@ -4,6 +4,8 @@
 
 pub mod types;
 
+mod fast;
+
 pub(crate) mod internals;
 
 mod functions;

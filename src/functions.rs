@@ -5,10 +5,11 @@
 //! expose the API of the original `Text.IPv6Addr` module, with an [`Option`]
 //! standing in for the `Maybe` monad.
 
+use crate::fast;
 use crate::internals::{
     canonized_sixteen_bit, expand_tokens, from_double_colon, ipv6_addr_to_std, ipv6_addr_tokens,
-    ipv6_tokens_to_ipv6_addr, ipv6_tokens_to_text, is_ipv6_addr, mac_addr, to_double_colon,
-    tok_ipv6_addr, tok_pure_ipv6_addr, tokens_to_ipv6, valid_sixteen_bit,
+    ipv6_tokens_to_ipv6_addr, is_ipv6_addr, mac_addr, to_double_colon, tok_ipv6_addr,
+    tok_pure_ipv6_addr, valid_sixteen_bit,
 };
 use crate::types::{Ipv6Addr, Ipv6AddrToken, Ipv6AddrTokens};
 
@@ -23,6 +24,10 @@ use crate::types::{Ipv6Addr, Ipv6AddrToken, Ipv6AddrTokens};
 ///
 /// > ipv6_addr("0:0::FFFF:192.0.2.128") == Some(Ipv6Addr("::ffff:192.0.2.128"))
 pub fn ipv6_addr(text: &str) -> Option<Ipv6Addr> {
+    if let Some(addr) = fast::parse(text) {
+        let keep_ipv4 = fast::has_dotted_ipv4(text) && fast::keeps_ipv4_tail(addr.segments());
+        return Some(Ipv6Addr::from(fast::canonical(addr, keep_ipv4)));
+    }
     tok_ipv6_addr(text).and_then(|tks| ipv6_tokens_to_ipv6_addr(&tks))
 }
 
@@ -32,6 +37,9 @@ pub fn ipv6_addr(text: &str) -> Option<Ipv6Addr> {
 ///
 /// > pure_ipv6_addr("::ffff:192.0.2.128") == Some(Ipv6Addr("::ffff:c000:280"))
 pub fn pure_ipv6_addr(text: &str) -> Option<Ipv6Addr> {
+    if let Some(addr) = fast::parse(text) {
+        return Some(Ipv6Addr::from(fast::pure(addr)));
+    }
     tok_pure_ipv6_addr(text).and_then(|tks| ipv6_tokens_to_ipv6_addr(&tks))
 }
 
@@ -43,9 +51,12 @@ pub fn pure_ipv6_addr(text: &str) -> Option<Ipv6Addr> {
 /// > full_ipv6_addr("::ffff:192.0.2.128") ==
 /// >   Some(Ipv6Addr("0000:0000:0000:0000:0000:ffff:c000:0280"))
 pub fn full_ipv6_addr(text: &str) -> Option<Ipv6Addr> {
+    if let Some(addr) = fast::parse(text) {
+        return Some(Ipv6Addr::from(fast::full(addr)));
+    }
     let tks = tok_pure_ipv6_addr(text)?;
-    let tks = from_double_colon(&tks);
-    let tks = expand_tokens(&tks);
+    let tks = from_double_colon(tks);
+    let tks = expand_tokens(tks);
     ipv6_tokens_to_ipv6_addr(&tks)
 }
 
@@ -62,7 +73,7 @@ pub fn full_ipv6_addr(text: &str) -> Option<Ipv6Addr> {
 ///
 /// > let net_addr: std::net::Ipv6Addr = Ipv6Addr::from("::ffff:192.0.2.128").into();
 pub fn to_std_ipv6_addr(addr: &Ipv6Addr) -> Option<std::net::Ipv6Addr> {
-    ipv6_addr_to_std(addr)
+    fast::parse(&addr.0).or_else(|| ipv6_addr_to_std(addr))
 }
 
 /// Returns the canonical text representation of the given
@@ -86,18 +97,7 @@ pub fn from_std_ipv6_addr(addr: std::net::Ipv6Addr) -> Ipv6Addr {
 /// > to_ip6_arpa(&Ipv6Addr::from("4321:0:1:2:3:4:567:89ab")) ==
 /// >   Some("b.a.9.8.7.6.5.0.4.0.0.0.3.0.0.0.2.0.0.0.1.0.0.0.0.0.0.0.1.2.3.4.IP6.ARPA.")
 pub fn to_ip6_arpa(addr: &Ipv6Addr) -> Option<String> {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let tks = tok_pure_ipv6_addr(&addr.0)?;
-    let net = tokens_to_ipv6(&tks)?;
-    let mut hex = String::with_capacity(32);
-    for byte in net.octets() {
-        hex.push(HEX[usize::from(byte >> 4)] as char);
-        hex.push(HEX[usize::from(byte & 0x0f)] as char);
-    }
-    let mut arpa = String::with_capacity(63 + ".IP6.ARPA.".len());
-    arpa.extend(itertools::Itertools::intersperse(hex.chars().rev(), '.'));
-    arpa.push_str(".IP6.ARPA.");
-    Some(arpa)
+    to_std_ipv6_addr(addr).map(fast::arpa)
 }
 
 /// Returns the Windows UNC path name of the given IPv6 address.
@@ -108,18 +108,7 @@ pub fn to_ip6_arpa(addr: &Ipv6Addr) -> Option<String> {
 /// > to_unc(&Ipv6Addr::from("2001:0DB8:002a:1005:230:48ff:fe73:989d")) ==
 /// >   Some("2001-db8-2a-1005-230-48ff-fe73-989d.ipv6-literal.net")
 pub fn to_unc(addr: &Ipv6Addr) -> Option<String> {
-    let tks = tok_pure_ipv6_addr(&addr.0)?;
-    let text = ipv6_tokens_to_text(&tks);
-    let mut unc = String::with_capacity(text.len() + ".ipv6-literal.net".len());
-    for c in text.chars() {
-        if c == ':' {
-            unc.push('-');
-        } else {
-            unc.push(c);
-        }
-    }
-    unc.push_str(".ipv6-literal.net");
-    Some(unc)
+    to_std_ipv6_addr(addr).map(fast::unc)
 }
 
 /// A small, non-cryptographic pseudo-random number generator (xorshift64*).
@@ -175,13 +164,12 @@ impl XorShift64Star {
     }
 }
 
+/// The lowercase hexadecimal digits, indexed by value.
+const HEX_DIGITS: &[u8; 16] = b"0123456789abcdef";
+
 /// The hexadecimal digit corresponding to a value in 0..16.
 fn hex_digit_char(digit: u8) -> char {
-    if digit < 10 {
-        (b'0' + digit) as char
-    } else {
-        (b'a' + digit - 10) as char
-    }
+    HEX_DIGITS[usize::from(digit)] as char
 }
 
 /// Returns a random lowercase hexadecimal text of the given length.
@@ -206,8 +194,14 @@ fn rand_partial_ipv6_addr_with(rng: &mut XorShift64Star, n: usize) -> Ipv6AddrTo
     if n == 0 || n > 8 {
         return Ipv6AddrTokens::new();
     }
-    let chunks = (0..n).map(|_| valid_sixteen_bit(random_hex(rng, 4)));
-    itertools::Itertools::intersperse(chunks, Ipv6AddrToken::Colon).collect()
+    let mut tks = Ipv6AddrTokens::new();
+    for index in 0..n {
+        if index > 0 {
+            tks.push(Ipv6AddrToken::Colon);
+        }
+        tks.push(valid_sixteen_bit(random_hex(rng, 4)));
+    }
+    tks
 }
 
 /// Returns `Some` of a random 16-Bit chunk built from a mask, or `None` when
@@ -334,9 +328,8 @@ fn rand_ipv6_addr_with_prefix_core(
             if !is_ipv6_addr(&tks) {
                 return None;
             }
-            let tks = to_double_colon(&from_double_colon(&tks));
-            let addr = ipv6_tokens_to_ipv6_addr(&tks);
-            return addr;
+            let tks = to_double_colon(from_double_colon(tks));
+            return ipv6_tokens_to_ipv6_addr(&tks);
         }
     };
     ipv6_tokens_to_ipv6_addr(&tks)
@@ -352,7 +345,14 @@ fn rand_ipv6_addr_with_prefix_core(
 /// >   Some([SixteenBit("fa1d"), Colon, SixteenBit("58cc"), Colon, SixteenBit("9516")])
 pub fn mac_addr_to_ipv6_addr_tokens(text: &str) -> Option<Ipv6AddrTokens> {
     let tks = mac_addr(text)?;
-    Some(itertools::Itertools::intersperse(tks.into_iter(), Ipv6AddrToken::Colon).collect())
+    let mut out = Ipv6AddrTokens::new();
+    for (index, token) in tks.into_iter().enumerate() {
+        if index > 0 {
+            out.push(Ipv6AddrToken::Colon);
+        }
+        out.push(token);
+    }
+    Some(out)
 }
 
 #[cfg(test)]
@@ -471,6 +471,20 @@ mod tests {
         let addr = Ipv6Addr::from("no address");
         assert_eq!(to_ip6_arpa(&addr), None);
         assert_eq!(to_unc(&addr), None);
+    }
+
+    #[test]
+    fn malformed_compressed_addresses_are_rejected_without_panicking() {
+        for text in ["::12ab34cd", "::123412341234123412341234123412341234"] {
+            assert_eq!(ipv6_addr(text), None, "ipv6_addr({text:?})");
+            assert_eq!(pure_ipv6_addr(text), None, "pure_ipv6_addr({text:?})");
+            assert_eq!(full_ipv6_addr(text), None, "full_ipv6_addr({text:?})");
+            let addr = Ipv6Addr::from(text);
+            assert_eq!(to_std_ipv6_addr(&addr), None, "to_std_ipv6_addr({text:?})");
+            assert_eq!(to_ip6_arpa(&addr), None, "to_ip6_arpa({text:?})");
+            assert_eq!(to_unc(&addr), None, "to_unc({text:?})");
+            assert_ne!(addr, Ipv6Addr::from("::1"), "equality of {text:?}");
+        }
     }
 
     #[test]
