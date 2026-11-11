@@ -23,9 +23,6 @@ impl PartialEq for Ipv6Addr {
         if self.0 == other.0 {
             return true;
         }
-        if let (Some(a), Some(b)) = (crate::fast::parse(&self.0), crate::fast::parse(&other.0)) {
-            return a == b;
-        }
         let canonical = |text: &str| {
             crate::internals::tok_pure_ipv6_addr(text).and_then(crate::internals::tokens_to_ipv6)
         };
@@ -67,7 +64,7 @@ impl From<&str> for Ipv6Addr {
 /// >   == Ipv6Addr("::ffff:192.0.2.128")
 impl From<std::net::Ipv6Addr> for Ipv6Addr {
     fn from(addr: std::net::Ipv6Addr) -> Self {
-        Ipv6Addr(crate::fast::std_display(addr))
+        Ipv6Addr(addr.to_string())
     }
 }
 

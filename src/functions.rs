@@ -5,11 +5,10 @@
 //! expose the API of the original `Text.IPv6Addr` module, with an [`Option`]
 //! standing in for the `Maybe` monad.
 
-use crate::fast;
 use crate::internals::{
     canonized_sixteen_bit, expand_tokens, from_double_colon, ipv6_addr_to_std, ipv6_addr_tokens,
-    ipv6_tokens_to_ipv6_addr, is_ipv6_addr, mac_addr, to_double_colon, tok_ipv6_addr,
-    tok_pure_ipv6_addr, valid_sixteen_bit,
+    ipv6_tokens_to_ipv6_addr, ipv6_tokens_to_text, is_ipv6_addr, mac_addr, to_double_colon,
+    tok_ipv6_addr, tok_pure_ipv6_addr, tokens_to_ipv6, valid_sixteen_bit,
 };
 use crate::types::{Ipv6Addr, Ipv6AddrToken, Ipv6AddrTokens};
 
@@ -24,10 +23,6 @@ use crate::types::{Ipv6Addr, Ipv6AddrToken, Ipv6AddrTokens};
 ///
 /// > ipv6_addr("0:0::FFFF:192.0.2.128") == Some(Ipv6Addr("::ffff:192.0.2.128"))
 pub fn ipv6_addr(text: &str) -> Option<Ipv6Addr> {
-    if let Some(addr) = fast::parse(text) {
-        let keep_ipv4 = fast::has_dotted_ipv4(text) && fast::keeps_ipv4_tail(addr.segments());
-        return Some(Ipv6Addr::from(fast::canonical(addr, keep_ipv4)));
-    }
     tok_ipv6_addr(text).and_then(|tks| ipv6_tokens_to_ipv6_addr(&tks))
 }
 
@@ -37,9 +32,6 @@ pub fn ipv6_addr(text: &str) -> Option<Ipv6Addr> {
 ///
 /// > pure_ipv6_addr("::ffff:192.0.2.128") == Some(Ipv6Addr("::ffff:c000:280"))
 pub fn pure_ipv6_addr(text: &str) -> Option<Ipv6Addr> {
-    if let Some(addr) = fast::parse(text) {
-        return Some(Ipv6Addr::from(fast::pure(addr)));
-    }
     tok_pure_ipv6_addr(text).and_then(|tks| ipv6_tokens_to_ipv6_addr(&tks))
 }
 
@@ -51,9 +43,6 @@ pub fn pure_ipv6_addr(text: &str) -> Option<Ipv6Addr> {
 /// > full_ipv6_addr("::ffff:192.0.2.128") ==
 /// >   Some(Ipv6Addr("0000:0000:0000:0000:0000:ffff:c000:0280"))
 pub fn full_ipv6_addr(text: &str) -> Option<Ipv6Addr> {
-    if let Some(addr) = fast::parse(text) {
-        return Some(Ipv6Addr::from(fast::full(addr)));
-    }
     let tks = tok_pure_ipv6_addr(text)?;
     let tks = from_double_colon(tks);
     let tks = expand_tokens(tks);
@@ -73,7 +62,7 @@ pub fn full_ipv6_addr(text: &str) -> Option<Ipv6Addr> {
 ///
 /// > let net_addr: std::net::Ipv6Addr = Ipv6Addr::from("::ffff:192.0.2.128").into();
 pub fn to_std_ipv6_addr(addr: &Ipv6Addr) -> Option<std::net::Ipv6Addr> {
-    fast::parse(&addr.0).or_else(|| ipv6_addr_to_std(addr))
+    ipv6_addr_to_std(addr)
 }
 
 /// Returns the canonical text representation of the given
@@ -97,7 +86,23 @@ pub fn from_std_ipv6_addr(addr: std::net::Ipv6Addr) -> Ipv6Addr {
 /// > to_ip6_arpa(&Ipv6Addr::from("4321:0:1:2:3:4:567:89ab")) ==
 /// >   Some("b.a.9.8.7.6.5.0.4.0.0.0.3.0.0.0.2.0.0.0.1.0.0.0.0.0.0.0.1.2.3.4.IP6.ARPA.")
 pub fn to_ip6_arpa(addr: &Ipv6Addr) -> Option<String> {
-    to_std_ipv6_addr(addr).map(fast::arpa)
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let tks = tok_pure_ipv6_addr(&addr.0)?;
+    let net = tokens_to_ipv6(tks)?;
+    let mut hex = String::with_capacity(32);
+    for byte in net.octets() {
+        hex.push(HEX[usize::from(byte >> 4)] as char);
+        hex.push(HEX[usize::from(byte & 0x0f)] as char);
+    }
+    let mut arpa = String::with_capacity(63 + ".IP6.ARPA.".len());
+    for (index, c) in hex.chars().rev().enumerate() {
+        if index > 0 {
+            arpa.push('.');
+        }
+        arpa.push(c);
+    }
+    arpa.push_str(".IP6.ARPA.");
+    Some(arpa)
 }
 
 /// Returns the Windows UNC path name of the given IPv6 address.
@@ -108,7 +113,18 @@ pub fn to_ip6_arpa(addr: &Ipv6Addr) -> Option<String> {
 /// > to_unc(&Ipv6Addr::from("2001:0DB8:002a:1005:230:48ff:fe73:989d")) ==
 /// >   Some("2001-db8-2a-1005-230-48ff-fe73-989d.ipv6-literal.net")
 pub fn to_unc(addr: &Ipv6Addr) -> Option<String> {
-    to_std_ipv6_addr(addr).map(fast::unc)
+    let tks = tok_pure_ipv6_addr(&addr.0)?;
+    let text = ipv6_tokens_to_text(&tks);
+    let mut unc = String::with_capacity(text.len() + ".ipv6-literal.net".len());
+    for c in text.chars() {
+        if c == ':' {
+            unc.push('-');
+        } else {
+            unc.push(c);
+        }
+    }
+    unc.push_str(".ipv6-literal.net");
+    Some(unc)
 }
 
 /// A small, non-cryptographic pseudo-random number generator (xorshift64*).
