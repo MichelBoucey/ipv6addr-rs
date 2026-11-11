@@ -104,7 +104,12 @@ pub(crate) fn is_ipv6_addr(tks: &Ipv6AddrTokens) -> bool {
                     Ipv6AddrToken::SixteenBit(_) | Ipv6AddrToken::AllZeros,
                     Ipv6AddrToken::SixteenBit(_) | Ipv6AddrToken::AllZeros,
                 ) => return false,
-                // Colon and IPv4Addr tokens are transparent.
+                // An embedded IPv4 address must be separated by a colon too.
+                (
+                    Ipv6AddrToken::SixteenBit(_) | Ipv6AddrToken::AllZeros,
+                    Ipv6AddrToken::Ipv4Addr(_),
+                ) => return false,
+                // The other adjacencies are checked by the chunk counting.
                 _ => {}
             }
         }
@@ -146,8 +151,23 @@ pub(crate) fn is_ipv6_addr(tks: &Ipv6AddrTokens) -> bool {
             ) && lenconst
         }
         1 => {
+            // An embedded IPv4 address stands for two 16-Bit chunks, so the
+            // token count alone cannot decide the address length.
+            let chunks = tks
+                .iter()
+                .filter(|token| {
+                    matches!(
+                        token,
+                        Ipv6AddrToken::SixteenBit(_) | Ipv6AddrToken::AllZeros
+                    )
+                })
+                .count();
             matches!(lasttk, Ipv6AddrToken::Ipv4Addr(_))
-                && ((lentks == 13 && double_colons == 0) || (lentks < 12 && double_colons == 1))
+                && match double_colons {
+                    0 => chunks + 2 == 8,
+                    1 => chunks + 2 < 8,
+                    _ => false,
+                }
         }
         _ => false,
     }
@@ -157,24 +177,16 @@ pub(crate) fn is_ipv6_addr(tks: &Ipv6AddrTokens) -> bool {
 /// representation, validated against RFC 4291 and canonized in
 /// conformation with RFC 5952, or `None`.
 ///
-/// An embedded IPv4 address is kept in its text representation when the
-/// address belongs to a well-known IPv4/IPv6 transition prefix
-/// (RFC 5952 Section 5), otherwise it is rewritten to hexadecimal digits.
+/// The text representation of an embedded IPv4 address depends on the
+/// address class, not on the input form: the addresses of the well-known
+/// IPv4/IPv6 transition prefixes (RFC 5952 Section 5) get a dotted IPv4
+/// tail, the other addresses get hexadecimal chunks.
 pub(crate) fn tok_ipv6_addr(text: &str) -> Option<Ipv6AddrTokens> {
     let tks = ipv6_addr_tokens(text)?;
     if !is_ipv6_addr(&tks) {
         return None;
     }
-    // The transition-prefix detection is defined on the compressed token
-    // list, so compress before testing it.
-    let tks = to_double_colon(from_double_colon(tks));
-    if !ipv4_addr_rewrite(&tks) {
-        return Some(tks);
-    }
-    // Rewriting the IPv4 tail can merge its zero chunks with a preceding zero
-    // run: expand the existing compression again and recompress the result.
-    let tks = rewrite_ipv4_tail(tks)?;
-    Some(to_double_colon(from_double_colon(tks)))
+    canonize_valid_tokens(tks)
 }
 
 /// Returns the tokenized list of a canonized pure IPv6 address text
@@ -236,88 +248,95 @@ pub(crate) fn ipv6_addr_tokens(text: &str) -> Option<Ipv6AddrTokens> {
     Some(tks)
 }
 
-/// Returns `true` when the embedded IPv4 address has to be rewritten to
-/// hexadecimal digits: i.e. when it does **not** stand for a well-known
-/// IPv4/IPv6 transition prefix (RFC 5952 Section 5).
+/// Returns `true` when the last 32 bits of the address have to be rendered
+/// as a dotted IPv4 address (RFC 5952 Section 5).
 ///
-/// The prefix addresses keep their IPv4 text representation:
-///
-/// IPv4-compatible IPv6 address like "::1.2.3.4"
-///
-/// IPv4-mapped IPv6 address like "::ffff:1.2.3.4"
-///
-/// IPv4-translated address like "::ffff:0:1.2.3.4"
-///
-/// IPv4-translatable address like "64:ff9b::1.2.3.4"
-///
-/// ISATAP address like "fe80::5efe:1.2.3.4"
-fn ipv4_addr_rewrite(tks: &Ipv6AddrTokens) -> bool {
-    if !matches!(tks.last(), Some(Ipv6AddrToken::Ipv4Addr(_))) {
-        return false;
-    }
-    let itks = &tks[..tks.len() - 1];
-    let is_transition_prefix = matches!(itks, [Ipv6AddrToken::DoubleColon])
-        || matches!(
-            itks,
-            [Ipv6AddrToken::DoubleColon, Ipv6AddrToken::SixteenBit(s), Ipv6AddrToken::Colon]
-                if s == "ffff"
-        )
-        || matches!(
-            itks,
-            [
-                Ipv6AddrToken::DoubleColon,
-                Ipv6AddrToken::SixteenBit(s),
-                Ipv6AddrToken::Colon,
-                Ipv6AddrToken::AllZeros,
-                Ipv6AddrToken::Colon,
-            ] if s == "ffff"
-        )
-        || matches!(
-            itks,
-            [
-                Ipv6AddrToken::SixteenBit(a),
-                Ipv6AddrToken::Colon,
-                Ipv6AddrToken::SixteenBit(b),
-                Ipv6AddrToken::DoubleColon,
-            ] if a == "64" && b == "ff9b"
-        )
-        || is_isatap_suffix(itks);
-    !is_transition_prefix
+/// The IPv4 text representation is kept for the IPv4-mapped,
+/// IPv4-compatible, IPv4-translated, IPv4-translatable and ISATAP address
+/// classes. The unspecified and loopback addresses are not IPv4-compatible
+/// addresses, so they keep their pure IPv6 representation.
+fn keeps_ipv4_tail(segments: &[u16; 8]) -> bool {
+    let mapped = segments[..5].iter().all(|&s| s == 0) && segments[5] == 0xffff;
+    let translated =
+        segments[..4].iter().all(|&s| s == 0) && segments[4] == 0xffff && segments[5] == 0;
+    let translatable =
+        segments[0] == 0x64 && segments[1] == 0xff9b && segments[2..6].iter().all(|&s| s == 0);
+    let isatap = segments[5] == 0x5efe && matches!(segments[4], 0 | 0x0200);
+    let compatible =
+        segments[..6].iter().all(|&s| s == 0) && !(segments[6] == 0 && segments[7] <= 1);
+    mapped || translated || translatable || isatap || compatible
 }
 
-/// Returns `true` when the token list ends with one of the ISATAP
-/// suffixes "[200:5efe:]", "[0:5efe:]" or "[::5efe:]".
-fn is_isatap_suffix(itks: &[Ipv6AddrToken]) -> bool {
-    let l = itks.len();
-    (l >= 4
-        && matches!(
-            &itks[l - 4..],
-            [
-                Ipv6AddrToken::SixteenBit(a),
-                Ipv6AddrToken::Colon,
-                Ipv6AddrToken::SixteenBit(b),
-                Ipv6AddrToken::Colon,
-            ] if a == "200" && b == "5efe"
-        ))
-        || (l >= 4
-            && matches!(
-                &itks[l - 4..],
-                [
-                    Ipv6AddrToken::AllZeros,
-                    Ipv6AddrToken::Colon,
-                    Ipv6AddrToken::SixteenBit(b),
-                    Ipv6AddrToken::Colon,
-                ] if b == "5efe"
-            ))
-        || (l >= 3
-            && matches!(
-                &itks[l - 3..],
-                [
-                    Ipv6AddrToken::DoubleColon,
-                    Ipv6AddrToken::SixteenBit(b),
-                    Ipv6AddrToken::Colon,
-                ] if b == "5efe"
-            ))
+/// Builds the token list of the RFC 5952 text representation of an address
+/// given by its eight 16-Bit chunks.
+///
+/// The token list is not compressed: it is meant to be passed to
+/// [`to_double_colon`].
+fn segments_to_ipv6_addr_tokens(segments: &[u16; 8]) -> Ipv6AddrTokens {
+    if keeps_ipv4_tail(segments) {
+        mixed_tokens(segments)
+    } else {
+        pure_tokens(segments)
+    }
+}
+
+/// Builds the token list of the eight 16-Bit chunks of an address.
+fn pure_tokens(segments: &[u16; 8]) -> Ipv6AddrTokens {
+    let mut tks = Ipv6AddrTokens::new();
+    for (index, &segment) in segments.iter().enumerate() {
+        if index > 0 {
+            tks.push(Ipv6AddrToken::Colon);
+        }
+        tks.push(hex_chunk_token(segment));
+    }
+    tks
+}
+
+/// Builds the token list of the six leading 16-Bit chunks of an address,
+/// followed by its last 32 bits in dotted IPv4 notation.
+fn mixed_tokens(segments: &[u16; 8]) -> Ipv6AddrTokens {
+    let mut tks = Ipv6AddrTokens::new();
+    for (index, &segment) in segments[..6].iter().enumerate() {
+        if index > 0 {
+            tks.push(Ipv6AddrToken::Colon);
+        }
+        tks.push(hex_chunk_token(segment));
+    }
+    tks.push(Ipv6AddrToken::Colon);
+    tks.push(format_ipv4_tail(segments[6], segments[7]));
+    tks
+}
+
+/// Builds the dotted IPv4 token of the last 32 bits of an address.
+fn format_ipv4_tail(high: u16, low: u16) -> Ipv6AddrToken {
+    let bytes = [(high >> 8) as u8, high as u8, (low >> 8) as u8, low as u8];
+    let mut text = String::with_capacity(15);
+    for (index, &byte) in bytes.iter().enumerate() {
+        if index > 0 {
+            text.push('.');
+        }
+        push_decimal(&mut text, byte);
+    }
+    Ipv6AddrToken::Ipv4Addr(text)
+}
+
+/// Canonizes a valid token list in conformation with RFC 5952.
+///
+/// An embedded IPv4 address is first resolved to its two 16-Bit chunks, so
+/// that the address class can be determined from the eight chunks. The text
+/// representation of the last 32 bits then depends on that class, not on
+/// the input form.
+pub(crate) fn canonize_valid_tokens(tks: Ipv6AddrTokens) -> Option<Ipv6AddrTokens> {
+    let pure = rewrite_ipv4_tail(tks)?;
+    let segments = tokens_to_ipv6(pure)?.segments();
+    Some(to_double_colon(segments_to_ipv6_addr_tokens(&segments)))
+}
+
+/// Returns the RFC 5952 text representation of an address given by its
+/// eight 16-Bit chunks.
+pub(crate) fn ipv6_addr_from_segments(segments: [u16; 8]) -> Ipv6Addr {
+    let tks = to_double_colon(segments_to_ipv6_addr_tokens(&segments));
+    Ipv6Addr::from(ipv6_tokens_to_text(&tks))
 }
 
 /// Rewrites an embedded IPv4 address into the corresponding list of pure
@@ -762,6 +781,11 @@ mod tests {
         assert!(is_ipv6_addr(&tks_of("::1:2:3:4:5:6:7")));
         assert!(is_ipv6_addr(&tks_of("::ffff:192.0.2.128")));
         assert!(is_ipv6_addr(&tks_of("64:ff9b::1.2.3.4")));
+        // An embedded IPv4 address stands for two 16-Bit chunks.
+        assert!(is_ipv6_addr(&tks_of("1:2:3:4:5:6:1.2.3.4")));
+        assert!(is_ipv6_addr(&tks_of("::1:2:3:4:5:1.2.3.4")));
+        assert!(is_ipv6_addr(&tks_of("::ffff:0:1.2.3.4")));
+        assert!(is_ipv6_addr(&tks_of("fe80::200:5efe:1.2.3.4")));
     }
 
     #[test]
@@ -774,6 +798,12 @@ mod tests {
         assert!(!is_ipv6_addr(&tks_of("1:2:3:4:5:6:7:8:9")));
         assert!(!is_ipv6_addr(&tks_of("::1:2:3:4:5:6:7:8")));
         assert!(!is_ipv6_addr(&tks_of("1.2.3.4")));
+        // The embedded IPv4 address must be separated by a colon.
+        assert!(!is_ipv6_addr(&tks_of("::ffff192.0.2.1")));
+        assert!(!is_ipv6_addr(&tks_of("::abcd1.2.3.4")));
+        assert!(!is_ipv6_addr(&tks_of("::123456.7.8.9")));
+        // "::" cannot stand for zero chunks.
+        assert!(!is_ipv6_addr(&tks_of("::1:2:3:4:5:6:1.2.3.4")));
     }
 
     #[test]
@@ -864,6 +894,45 @@ mod tests {
             text_of(&tok_ipv6_addr("1:2:3:4:5:6:192.0.2.1").expect("should parse")),
             "1:2:3:4:5:6:c000:201"
         );
+        // The representation depends on the address class, not on the
+        // input form: a pure hexadecimal mapped address gets a dotted tail.
+        assert_eq!(
+            text_of(&tok_ipv6_addr("::ffff:c000:201").expect("should parse")),
+            "::ffff:192.0.2.1"
+        );
+        // IPv4-compatible addresses get a dotted tail too.
+        assert_eq!(
+            text_of(&tok_ipv6_addr("::0.0.0.2").expect("should parse")),
+            "::0.0.0.2"
+        );
+        assert_eq!(
+            text_of(&tok_ipv6_addr("::2").expect("should parse")),
+            "::0.0.0.2"
+        );
+        // The unspecified and loopback addresses are not IPv4-compatible.
+        assert_eq!(
+            text_of(&tok_ipv6_addr("::0.0.0.1").expect("should parse")),
+            "::1"
+        );
+        assert_eq!(
+            text_of(&tok_ipv6_addr("::0.0.0.0").expect("should parse")),
+            "::"
+        );
+        // The IPv4-mapped zero address keeps a dotted tail.
+        assert_eq!(
+            text_of(&tok_ipv6_addr("::ffff:0:0").expect("should parse")),
+            "::ffff:0.0.0.0"
+        );
+        // IPv4-translated address.
+        assert_eq!(
+            text_of(&tok_ipv6_addr("::ffff:0:1.2.3.4").expect("should parse")),
+            "::ffff:0:1.2.3.4"
+        );
+        // ISATAP address with the 0200:5efe interface identifier.
+        assert_eq!(
+            text_of(&tok_ipv6_addr("fe80::200:5efe:192.0.2.1").expect("should parse")),
+            "fe80::200:5efe:192.0.2.1"
+        );
     }
 
     #[test]
@@ -882,6 +951,24 @@ mod tests {
             text_of(&tok_ipv6_addr("1:0:0:0:0:0:0:1").expect("should parse")),
             "1::1"
         );
+    }
+
+    #[test]
+    fn ipv6_addr_from_segments_renders_the_rfc_5952_text() {
+        assert_eq!(
+            ipv6_addr_from_segments([0x2001, 0xdb8, 0, 0, 0, 0, 0, 1]).0,
+            "2001:db8::1"
+        );
+        assert_eq!(
+            ipv6_addr_from_segments([0, 0, 0, 0, 0, 0, 0, 2]).0,
+            "::0.0.0.2"
+        );
+        assert_eq!(
+            ipv6_addr_from_segments([0, 0, 0, 0, 0, 0xffff, 0xc000, 0x0201]).0,
+            "::ffff:192.0.2.1"
+        );
+        assert_eq!(ipv6_addr_from_segments([0; 8]).0, "::");
+        assert_eq!(ipv6_addr_from_segments([0, 0, 0, 0, 0, 0, 0, 1]).0, "::1");
     }
 
     #[test]

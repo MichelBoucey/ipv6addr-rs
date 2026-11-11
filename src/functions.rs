@@ -6,20 +6,22 @@
 //! standing in for the `Maybe` monad.
 
 use crate::internals::{
-    canonized_sixteen_bit, expand_tokens, from_double_colon, ipv6_addr_to_std, ipv6_addr_tokens,
-    ipv6_tokens_to_ipv6_addr, ipv6_tokens_to_text, is_ipv6_addr, mac_addr, to_double_colon,
-    tok_ipv6_addr, tok_pure_ipv6_addr, tokens_to_ipv6, valid_sixteen_bit,
+    canonize_valid_tokens, canonized_sixteen_bit, expand_tokens, from_double_colon,
+    ipv6_addr_to_std, ipv6_addr_tokens, ipv6_tokens_to_ipv6_addr, ipv6_tokens_to_text,
+    is_ipv6_addr, mac_addr, tok_ipv6_addr, tok_pure_ipv6_addr, tokens_to_ipv6,
 };
 use crate::types::{Ipv6Addr, Ipv6AddrToken, Ipv6AddrTokens};
 
 /// Returns `Some` of the text representation of a canonized IPv6 address in
 /// conformation with RFC 5952, or `None`.
 ///
-/// An embedded IPv4 address keeps its IPv4 text representation when it
-/// stands for a well-known IPv4/IPv6 transition prefix (RFC 5952
-/// Section 5): IPv4-compatible "::1.2.3.4", IPv4-mapped "::ffff:1.2.3.4",
-/// IPv4-translated "::ffff:0:1.2.3.4", IPv4-translatable "64:ff9b::1.2.3.4"
-/// or ISATAP "fe80::5efe:1.2.3.4" addresses.
+/// An embedded IPv4 address keeps its IPv4 text representation when the
+/// address belongs to a well-known IPv4/IPv6 transition prefix (RFC 5952
+/// Section 5): IPv4-compatible "::1.2.3.4" (except "::" and "::1"),
+/// IPv4-mapped "::ffff:1.2.3.4", IPv4-translated "::ffff:0:1.2.3.4",
+/// IPv4-translatable "64:ff9b::1.2.3.4" or ISATAP "fe80::5efe:1.2.3.4"
+/// addresses. The representation only depends on the address class, not on
+/// the input form.
 ///
 /// > ipv6_addr("0:0::FFFF:192.0.2.128") == Some(Ipv6Addr("::ffff:192.0.2.128"))
 pub fn ipv6_addr(text: &str) -> Option<Ipv6Addr> {
@@ -68,8 +70,8 @@ pub fn to_std_ipv6_addr(addr: &Ipv6Addr) -> Option<std::net::Ipv6Addr> {
 /// Returns the canonical text representation of the given
 /// `std::net::Ipv6Addr`, in conformation with RFC 5952.
 ///
-/// The IPv4-mapped addresses keep their IPv4 text representation, as
-/// `std::net::Ipv6Addr` renders them:
+/// The last 32 bits are rendered as a dotted IPv4 address for the
+/// well-known IPv4/IPv6 transition prefixes (RFC 5952 Section 5):
 ///
 /// > from_std_ipv6_addr(std::net::Ipv6Addr::new(0, 0, 0, 0, 0, 0xffff, 0xc000, 0x0280))
 /// >   == Ipv6Addr("::ffff:192.0.2.128")
@@ -200,6 +202,9 @@ fn random_hex(rng: &mut XorShift64Star, length: usize) -> String {
 /// Returns a token list of a random partial IPv6 address of `n` 16-Bit
 /// chunks, or an empty list when `n` is not in the 1..8 range.
 ///
+/// Each chunk is canonized in conformation with RFC 5952: leading zeroes
+/// are dropped and an all-zero chunk becomes an `AllZeros` token.
+///
 /// > rand_partial_ipv6_addr(3) reads 3 random chunks separated by colons.
 pub fn rand_partial_ipv6_addr(n: usize) -> Ipv6AddrTokens {
     rand_partial_ipv6_addr_with(&mut XorShift64Star::from_system_seed(), n)
@@ -215,7 +220,9 @@ fn rand_partial_ipv6_addr_with(rng: &mut XorShift64Star, n: usize) -> Ipv6AddrTo
         if index > 0 {
             tks.push(Ipv6AddrToken::Colon);
         }
-        tks.push(valid_sixteen_bit(random_hex(rng, 4)));
+        let chunk = canonized_sixteen_bit(&random_hex(rng, 4))
+            .expect("four hexadecimal digits form a valid chunk");
+        tks.push(chunk);
     }
     tks
 }
@@ -253,8 +260,11 @@ fn rand_ipv6_addr_chunk_with(rng: &mut XorShift64Star, mask: &str) -> Option<Ipv
     canonized_sixteen_bit(&built)
 }
 
-/// Returns a random IPv6 address, an embedded IPv4 address being always
-/// rewritten as hexadecimal digits.
+/// Returns a random IPv6 address, canonized in conformation with RFC 5952.
+///
+/// The last 32 bits of an address of a well-known IPv4/IPv6 transition
+/// prefix (RFC 5952 Section 5) are rendered as a dotted IPv4 address, as
+/// [`ipv6_addr`] does.
 pub fn rand_ipv6_addr() -> Ipv6Addr {
     match rand_ipv6_addr_with_prefix_core(&mut XorShift64Star::from_system_seed(), None) {
         Some(addr) => addr,
@@ -266,6 +276,9 @@ pub fn rand_ipv6_addr() -> Ipv6Addr {
 /// Returns a random IPv6 address completed with random 16-Bit chunks when a
 /// prefix is given, or `None` when the prefix cannot be completed into a
 /// valid address.
+///
+/// A prefix that already is a valid IPv6 address is returned as the
+/// canonized address.
 pub fn rand_ipv6_addr_with_prefix(prefix: Option<&str>) -> Option<Ipv6Addr> {
     rand_ipv6_addr_with_prefix_core(&mut XorShift64Star::from_system_seed(), prefix)
 }
@@ -309,10 +322,15 @@ fn rand_ipv6_addr_with_prefix_core(
                 }
             }
         }
-        // With a prefix, the remaining chunks are drawn to complete it.
+        // With a prefix, the remaining chunks are drawn to complete it,
+        // unless the prefix already is a complete address.
         Some(p) => {
             // let tks = fromJust (maybeIPv6AddrTokens p)
             let mut tks = ipv6_addr_tokens(p)?;
+            // An already valid prefix is returned as the canonized address.
+            if is_ipv6_addr(&tks) {
+                return canonize_valid_tokens(tks).and_then(|tks| ipv6_tokens_to_ipv6_addr(&tks));
+            }
             // countChunks: number of 16-Bit chunks and of "::".
             let (chunks, double_colons) =
                 tks.iter()
@@ -344,11 +362,10 @@ fn rand_ipv6_addr_with_prefix_core(
             if !is_ipv6_addr(&tks) {
                 return None;
             }
-            let tks = to_double_colon(from_double_colon(tks));
-            return ipv6_tokens_to_ipv6_addr(&tks);
+            tks
         }
     };
-    ipv6_tokens_to_ipv6_addr(&tks)
+    canonize_valid_tokens(tks).and_then(|tks| ipv6_tokens_to_ipv6_addr(&tks))
 }
 
 /// Returns `Some` of the token list of the IPv6 address derived from the
@@ -418,6 +435,12 @@ mod tests {
         assert_eq!(
             from_std_ipv6_addr(std::net::Ipv6Addr::LOCALHOST),
             Ipv6Addr::from("::1")
+        );
+        assert_eq!(from_std_ipv6_addr(std::net::Ipv6Addr::UNSPECIFIED).0, "::");
+        assert_eq!(from_std_ipv6_addr(std::net::Ipv6Addr::LOCALHOST).0, "::1");
+        assert_eq!(
+            from_std_ipv6_addr(std::net::Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 2)).0,
+            "::0.0.0.2"
         );
     }
 
@@ -531,15 +554,23 @@ mod tests {
         let mut rng = XorShift64Star::with_seed(7);
         let tks = rand_partial_ipv6_addr_with(&mut rng, 3);
         assert_eq!(tks.len(), 5);
-        assert!(matches!(tks[0], Ipv6AddrToken::SixteenBit(_)));
         assert_eq!(tks[1], Ipv6AddrToken::Colon);
-        assert!(matches!(tks[2], Ipv6AddrToken::SixteenBit(_)));
         assert_eq!(tks[3], Ipv6AddrToken::Colon);
-        assert!(matches!(tks[4], Ipv6AddrToken::SixteenBit(_)));
         for i in [0, 2, 4] {
-            if let Ipv6AddrToken::SixteenBit(chunk) = &tks[i] {
-                assert_eq!(chunk.len(), 4);
-                assert!(chunk.chars().all(|c| c.is_ascii_hexdigit()));
+            assert_valid_chunk(&tks[i]);
+        }
+    }
+
+    #[test]
+    fn partial_addresses_are_canonical() {
+        for seed in 0..64 {
+            let mut rng = XorShift64Star::with_seed(seed);
+            let tks = rand_partial_ipv6_addr_with(&mut rng, 8);
+            for token in tks
+                .iter()
+                .filter(|token| !matches!(token, Ipv6AddrToken::Colon))
+            {
+                assert_valid_chunk(token);
             }
         }
     }
@@ -564,8 +595,9 @@ mod tests {
         }
     }
 
-    /// Asserts that a token emitted as a chunk is a valid one: a `SixteenBit`
-    /// of 1 to 4 lowercase hexadecimal digits, or an `AllZeros` token.
+    /// Asserts that a token emitted as a chunk is a canonical one: a
+    /// `SixteenBit` of 1 to 4 lowercase hexadecimal digits without a leading
+    /// zero, or an `AllZeros` token.
     fn assert_valid_chunk(token: &Ipv6AddrToken) {
         match token {
             Ipv6AddrToken::SixteenBit(s) => {
@@ -578,9 +610,10 @@ mod tests {
                     "chunk {s:?} is hexadecimal"
                 );
                 assert_eq!(s, &s.to_ascii_lowercase(), "chunk {s:?} is lowercase");
+                assert!(!s.starts_with('0'), "chunk {s:?} has no leading zero");
             }
             Ipv6AddrToken::AllZeros => {}
-            other => panic!("a masked chunk is a chunk token, got {other:?}"),
+            other => panic!("a chunk token is expected, got {other:?}"),
         }
     }
 
@@ -642,26 +675,63 @@ mod tests {
     #[test]
     fn a_prefix_is_completed_by_random_chunks() {
         let mut rng = XorShift64Star::with_seed(3);
-        match rand_ipv6_addr_with_prefix_core(&mut rng, Some("4321:0:1:2:3:4")) {
-            Some(addr) => {
-                assert!(addr.0.starts_with("4321:0:1:2:3:4:"));
-                assert!(ipv6_addr(&addr.0).is_some());
-            }
-            None => panic!("a 6-chunk prefix must be completable into an address"),
+        let addr = rand_ipv6_addr_with_prefix_core(&mut rng, Some("4321:0:1:2:3:4"))
+            .expect("a 6-chunk prefix must be completable into an address");
+        let net = to_std_ipv6_addr(&addr).expect("the completed address is valid");
+        assert_eq!(&net.segments()[..6], &[0x4321, 0, 1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn a_complete_prefix_is_returned_canonized() {
+        for (prefix, expected) in [
+            ("::", "::"),
+            ("0:0:0:0:0:0:0:1", "::1"),
+            ("1:2:3:4:5:6:7:8", "1:2:3:4:5:6:7:8"),
+            ("1::2", "1::2"),
+            ("::ffff:c000:280", "::ffff:192.0.2.128"),
+            ("::2", "::0.0.0.2"),
+        ] {
+            let mut rng = XorShift64Star::with_seed(23);
+            assert_eq!(
+                rand_ipv6_addr_with_prefix_core(&mut rng, Some(prefix)).map(|addr| addr.0),
+                Some(String::from(expected)),
+                "prefix {prefix:?}"
+            );
         }
     }
 
     #[test]
     fn an_uncompletable_prefix_returns_none() {
         let mut rng = XorShift64Star::with_seed(5);
-        assert_eq!(
-            rand_ipv6_addr_with_prefix_core(&mut rng, Some("1::2::3")),
-            None
-        );
-        assert_eq!(
-            rand_ipv6_addr_with_prefix_core(&mut rng, Some("1:2:3:4:5:6:7:8")),
-            None
-        );
+        for prefix in ["1::2::3", "1:2:3:4:5:6:7:8:9", "1:2:3:4:5:6:7:8::"] {
+            assert_eq!(
+                rand_ipv6_addr_with_prefix_core(&mut rng, Some(prefix)),
+                None,
+                "prefix {prefix:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn random_addresses_are_canonical() {
+        for seed in 0..256 {
+            let mut rng = XorShift64Star::with_seed(seed);
+            let addr = rand_ipv6_addr_with_prefix_core(&mut rng, None)
+                .expect("a random address is always produced");
+            let canon = ipv6_addr(&addr.0).expect("a random address is valid");
+            assert_eq!(addr.0, canon.0, "random address of seed {seed}");
+        }
+    }
+
+    #[test]
+    fn completed_prefixes_are_canonical() {
+        for seed in 0..256 {
+            let mut rng = XorShift64Star::with_seed(seed);
+            let addr = rand_ipv6_addr_with_prefix_core(&mut rng, Some("4321:0:1:2:3:4"))
+                .expect("the prefix is completable");
+            let canon = ipv6_addr(&addr.0).expect("the completed address is valid");
+            assert_eq!(addr.0, canon.0, "completed address of seed {seed}");
+        }
     }
 
     #[test]
@@ -680,8 +750,13 @@ mod tests {
         let addr = rand_ipv6_addr();
         assert!(ipv6_addr(&addr.0).is_some());
         if let Some(addr) = rand_ipv6_addr_with_prefix(Some("4321:0:1:2:3:4")) {
-            assert!(addr.0.starts_with("4321:0:1:2:3:4:"));
+            let net = to_std_ipv6_addr(&addr).expect("the completed address is valid");
+            assert_eq!(&net.segments()[..6], &[0x4321, 0, 1, 2, 3, 4]);
         }
         assert_eq!(rand_ipv6_addr_with_prefix(Some("::::")), None);
+        assert_eq!(
+            rand_ipv6_addr_with_prefix(Some("::")).map(|addr| addr.0),
+            Some(String::from("::"))
+        );
     }
 }

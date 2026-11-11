@@ -11,7 +11,8 @@
 
 use ipv6addr::{
     Ipv6Addr, Ipv6AddrToken, Ipv6AddrTokens, from_std_ipv6_addr, full_ipv6_addr, ipv6_addr,
-    mac_addr_to_ipv6_addr_tokens, pure_ipv6_addr, to_ip6_arpa, to_std_ipv6_addr, to_unc,
+    mac_addr_to_ipv6_addr_tokens, pure_ipv6_addr, rand_ipv6_addr, rand_ipv6_addr_with_prefix,
+    to_ip6_arpa, to_std_ipv6_addr, to_unc,
 };
 
 /// Asserts `ipv6_addr` on one input, by address value.
@@ -120,8 +121,41 @@ fn ipv6_addr_embedded_ipv4_forms() {
         ("::192.0.2.1", Some("::192.0.2.1")),
         ("192.0.2.1::", None),
         ("::ffff:192.0.2.1", Some("::ffff:192.0.2.1")),
+        // An embedded IPv4 address stands for two 16-Bit chunks.
+        ("1:2:3:4:5:6:1.2.3.4", Some("1:2:3:4:5:6:1.2.3.4")),
+        ("::1:2:3:4:5:1.2.3.4", Some("::1:2:3:4:5:1.2.3.4")),
+        // The embedded IPv4 address must be separated by a colon.
+        ("::ffff192.0.2.1", None),
+        ("::abcd1.2.3.4", None),
+        ("::123456.7.8.9", None),
     ] {
         check_ipv6_addr(input, expected);
+    }
+}
+
+#[test]
+fn ipv6_addr_renders_the_rfc_5952_section_5_classes() {
+    for (input, expected) in [
+        ("::1.2.3.4", "::1.2.3.4"),
+        ("::ffff:1.2.3.4", "::ffff:1.2.3.4"),
+        ("::ffff:0:1.2.3.4", "::ffff:0:1.2.3.4"),
+        ("64:ff9b::1.2.3.4", "64:ff9b::1.2.3.4"),
+        ("fe80::5efe:1.2.3.4", "fe80::5efe:1.2.3.4"),
+        ("fe80::200:5efe:1.2.3.4", "fe80::200:5efe:1.2.3.4"),
+        // The address class decides, not the input form.
+        ("::ffff:c000:201", "::ffff:192.0.2.1"),
+        ("::2", "::0.0.0.2"),
+        // The unspecified and loopback addresses are not compatible.
+        ("::0.0.0.0", "::"),
+        ("::0.0.0.1", "::1"),
+        // Any other embedded IPv4 address is rendered in hexadecimal.
+        ("1:2:3:4:5:6:192.0.2.1", "1:2:3:4:5:6:c000:201"),
+    ] {
+        assert_eq!(
+            ipv6_addr(input).map(|addr| addr.0),
+            Some(String::from(expected)),
+            "ipv6_addr({input:?})"
+        );
     }
 }
 
@@ -330,4 +364,35 @@ fn std_ipv6_addr_conversions_round_trip() {
 #[test]
 fn a_std_ipv6_addr_conversion_returns_none_for_a_garbage_addr() {
     assert_eq!(to_std_ipv6_addr(&Ipv6Addr::from("no address")), None);
+}
+
+#[test]
+fn rand_ipv6_addr_with_prefix_returns_a_complete_prefix_canonized() {
+    assert_eq!(
+        rand_ipv6_addr_with_prefix(Some("::")).map(|addr| addr.0),
+        Some(String::from("::"))
+    );
+    assert_eq!(
+        rand_ipv6_addr_with_prefix(Some("0:0:0:0:0:0:0:1")).map(|addr| addr.0),
+        Some(String::from("::1"))
+    );
+}
+
+#[test]
+fn random_addresses_are_canonical() {
+    for _ in 0..128 {
+        let addr = rand_ipv6_addr();
+        assert_eq!(
+            ipv6_addr(&addr.0).map(|canon| canon.0),
+            Some(addr.0.clone())
+        );
+    }
+    for _ in 0..128 {
+        let addr =
+            rand_ipv6_addr_with_prefix(Some("4321:0:1:2:3:4")).expect("the prefix is completable");
+        assert_eq!(
+            ipv6_addr(&addr.0).map(|canon| canon.0),
+            Some(addr.0.clone())
+        );
+    }
 }
