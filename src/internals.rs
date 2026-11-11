@@ -1,22 +1,24 @@
 //! Internal functions for tokenizing, validating and rewriting IPv6 addresses.
 //!
-//! Token lists are stored in a [`SmallVec`] (`crate::types::Ipv6AddrTokens`)
-//! and functions return an [`Option`] whenever the original design relied on a
+//! Token lists are stored inline in a [`crate::types::Ipv6AddrTokens`] and
+//! functions return an [`Option`] whenever the original design relied on a
 //! `Maybe`.
 //!
 //! The functions are consumed by the public API in `crate::functions` and by
 //! the canonical `Ipv6Addr` equality in `crate::types`.
 
 use crate::types::{Ipv6Addr, Ipv6AddrToken, Ipv6AddrTokens};
-use itertools::Itertools;
-use smallvec::SmallVec;
 
 /// Returns the corresponding text of a list of IPv6 address tokens.
 ///
 /// Given an arbitrary list of IPv6 address tokens, returns the
 /// corresponding text.
 pub(crate) fn ipv6_tokens_to_text(tks: &Ipv6AddrTokens) -> String {
-    tks.iter().map(ipv6_token_to_text).collect()
+    let mut out = String::with_capacity(tks.len() * 4);
+    for token in tks {
+        out.push_str(ipv6_token_to_text(token));
+    }
+    out
 }
 
 /// Returns the corresponding text of an IPv6 address token.
@@ -50,13 +52,15 @@ pub(crate) fn canonized_sixteen_bit(text: &str) -> Option<Ipv6AddrToken> {
     if !is_sixteen_bit(text) {
         return None;
     }
-    let lower = text.to_ascii_lowercase();
-    let trimmed = lower.trim_start_matches('0');
-    Some(if trimmed.is_empty() {
-        Ipv6AddrToken::AllZeros
-    } else {
-        Ipv6AddrToken::SixteenBit(trimmed.to_owned())
-    })
+    let trimmed = text.trim_start_matches('0');
+    if trimmed.is_empty() {
+        return Some(Ipv6AddrToken::AllZeros);
+    }
+    let mut digits = String::with_capacity(trimmed.len());
+    for &byte in trimmed.as_bytes() {
+        digits.push(byte.to_ascii_lowercase() as char);
+    }
+    Some(Ipv6AddrToken::SixteenBit(digits))
 }
 
 /// Builds a [`Ipv6AddrToken::SixteenBit`] from a text already known to be 1
@@ -74,13 +78,44 @@ pub(crate) fn is_ipv6_addr(tks: &Ipv6AddrTokens) -> bool {
     if tks.is_empty() {
         return false;
     }
-    // A SixteenBit token must hold 1 to 4 hexadecimal digits.
-    if !tks.iter().all(|t| match t {
-        Ipv6AddrToken::SixteenBit(s) => is_sixteen_bit(s),
-        _ => true,
-    }) {
-        return false;
+
+    // Validate the chunks and the token adjacencies in a single pass.
+    let mut double_colons = 0usize;
+    let mut ipv4_addrs = 0usize;
+    let mut previous: Option<&Ipv6AddrToken> = None;
+    for token in tks {
+        match token {
+            Ipv6AddrToken::SixteenBit(text) => {
+                // A SixteenBit token must hold 1 to 4 hexadecimal digits.
+                if !is_sixteen_bit(text) {
+                    return false;
+                }
+            }
+            Ipv6AddrToken::DoubleColon => double_colons += 1,
+            Ipv6AddrToken::Ipv4Addr(_) => ipv4_addrs += 1,
+            Ipv6AddrToken::AllZeros | Ipv6AddrToken::Colon => {}
+        }
+        if let Some(previous) = previous {
+            match (previous, token) {
+                // A "::" cannot be followed by another separator.
+                (Ipv6AddrToken::DoubleColon, Ipv6AddrToken::Colon) => return false,
+                // Two chunks must be separated by a colon, even after a "::".
+                (
+                    Ipv6AddrToken::SixteenBit(_) | Ipv6AddrToken::AllZeros,
+                    Ipv6AddrToken::SixteenBit(_) | Ipv6AddrToken::AllZeros,
+                ) => return false,
+                // An embedded IPv4 address must be separated by a colon too.
+                (
+                    Ipv6AddrToken::SixteenBit(_) | Ipv6AddrToken::AllZeros,
+                    Ipv6AddrToken::Ipv4Addr(_),
+                ) => return false,
+                // The other adjacencies are checked by the chunk counting.
+                _ => {}
+            }
+        }
+        previous = Some(token);
     }
+
     // [DoubleColon] -> True
     if tks.len() == 1 && matches!(tks[0], Ipv6AddrToken::DoubleColon) {
         return true;
@@ -93,16 +128,11 @@ pub(crate) fn is_ipv6_addr(tks: &Ipv6AddrTokens) -> bool {
         return true;
     }
 
-    if !diff_next(tks) {
-        return false;
-    }
-
-    let cdctks = count_double_colon(tks);
     let lentks = tks.len();
     let Some(lasttk) = tks.last() else {
         return false;
     };
-    let lenconst = (lentks == 15 && cdctks == 0) || (lentks < 15 && cdctks == 1);
+    let lenconst = (lentks == 15 && double_colons == 0) || (lentks < 15 && double_colons == 1);
 
     // The first token has to be a SixteenBit, a DoubleColon or an AllZeros chunk.
     let first_valid = matches!(
@@ -113,7 +143,7 @@ pub(crate) fn is_ipv6_addr(tks: &Ipv6AddrTokens) -> bool {
         return false;
     }
 
-    match count_ipv4_addr(tks) {
+    match ipv4_addrs {
         0 => {
             matches!(
                 lasttk,
@@ -121,81 +151,42 @@ pub(crate) fn is_ipv6_addr(tks: &Ipv6AddrTokens) -> bool {
             ) && lenconst
         }
         1 => {
+            // An embedded IPv4 address stands for two 16-Bit chunks, so the
+            // token count alone cannot decide the address length.
+            let chunks = tks
+                .iter()
+                .filter(|token| {
+                    matches!(
+                        token,
+                        Ipv6AddrToken::SixteenBit(_) | Ipv6AddrToken::AllZeros
+                    )
+                })
+                .count();
             matches!(lasttk, Ipv6AddrToken::Ipv4Addr(_))
-                && ((lentks == 13 && cdctks == 0) || (lentks < 12 && cdctks == 1))
+                && match double_colons {
+                    0 => chunks + 2 == 8,
+                    1 => chunks + 2 < 8,
+                    _ => false,
+                }
         }
         _ => false,
     }
-}
-
-/// Returns `false` when two consecutive tokens are not allowed
-/// (`DoubleColon` followed by `Colon`, or two chunks in a row), `true`
-/// otherwise.
-fn diff_next(tks: &Ipv6AddrTokens) -> bool {
-    // [] -> False
-    if tks.is_empty() {
-        return false;
-    }
-    // [_] -> True
-    if tks.len() == 1 {
-        return true;
-    }
-    let mut i = 0;
-    while i + 1 < tks.len() {
-        let t = &tks[i];
-        let h = &tks[i + 1];
-        match t {
-            Ipv6AddrToken::DoubleColon => return !matches!(h, Ipv6AddrToken::Colon),
-            Ipv6AddrToken::SixteenBit(_) | Ipv6AddrToken::AllZeros => {
-                if matches!(h, Ipv6AddrToken::SixteenBit(_) | Ipv6AddrToken::AllZeros) {
-                    return false;
-                }
-            }
-            // Colon and IPv4Addr tokens are transparent: keep scanning.
-            _ => {}
-        }
-        i += 1;
-    }
-    true
-}
-
-/// Returns the number of `DoubleColon` tokens in the list.
-fn count_double_colon(tks: &Ipv6AddrTokens) -> usize {
-    tks.iter()
-        .filter(|t| matches!(t, Ipv6AddrToken::DoubleColon))
-        .count()
-}
-
-/// Returns the number of embedded IPv4 address tokens in the list.
-pub(crate) fn count_ipv4_addr(tks: &Ipv6AddrTokens) -> usize {
-    tks.iter()
-        .filter(|t| matches!(t, Ipv6AddrToken::Ipv4Addr(_)))
-        .count()
 }
 
 /// Returns the tokenized list of a canonized IPv6 address text
 /// representation, validated against RFC 4291 and canonized in
 /// conformation with RFC 5952, or `None`.
 ///
-/// An embedded IPv4 address is kept in its text representation when the
-/// address belongs to a well-known IPv4/IPv6 transition prefix
-/// (RFC 5952 Section 5), otherwise it is rewritten to hexadecimal digits.
+/// The text representation of an embedded IPv4 address depends on the
+/// address class, not on the input form: the addresses of the well-known
+/// IPv4/IPv6 transition prefixes (RFC 5952 Section 5) get a dotted IPv4
+/// tail, the other addresses get hexadecimal chunks.
 pub(crate) fn tok_ipv6_addr(text: &str) -> Option<Ipv6AddrTokens> {
     let tks = ipv6_addr_tokens(text)?;
     if !is_ipv6_addr(&tks) {
         return None;
     }
-    let tks = to_double_colon(&from_double_colon(&tks));
-    let tks = if ipv4_addr_rewrite(&tks) {
-        let (last, init) = tks.split_last()?;
-        let mut out = Ipv6AddrTokens::new();
-        out.extend(init.iter().cloned());
-        out.extend(ipv4_addr_to_ipv6_addr_tokens(last));
-        out
-    } else {
-        tks
-    };
-    Some(tks)
+    canonize_valid_tokens(tks)
 }
 
 /// Returns the tokenized list of a canonized pure IPv6 address text
@@ -207,17 +198,18 @@ pub(crate) fn tok_pure_ipv6_addr(text: &str) -> Option<Ipv6AddrTokens> {
         return None;
     }
     // Always replace the embedded IPv4 address, if any.
-    let tks = from_double_colon(&tks);
-    let tks = match tks.split_last() {
-        Some((last, init)) => {
-            let mut out = Ipv6AddrTokens::new();
-            out.extend(init.iter().cloned());
-            out.extend(ipv4_addr_to_ipv6_addr_tokens(last));
-            out
-        }
-        None => return None,
-    };
-    Some(to_double_colon(&tks))
+    let tks = rewrite_ipv4_tail(from_double_colon(tks))?;
+    Some(to_double_colon(tks))
+}
+
+/// Replaces the last token by its IPv6 token representation, if any.
+///
+/// An embedded IPv4 address becomes two 16-Bit chunks; any other token is
+/// kept unchanged.
+fn rewrite_ipv4_tail(mut tks: Ipv6AddrTokens) -> Option<Ipv6AddrTokens> {
+    let last = tks.pop()?;
+    tks.extend(ipv4_addr_to_ipv6_addr_tokens(last));
+    Some(tks)
 }
 
 /// Tokenizes a text into a list of IPv6 address tokens, or returns `None`.
@@ -256,143 +248,158 @@ pub(crate) fn ipv6_addr_tokens(text: &str) -> Option<Ipv6AddrTokens> {
     Some(tks)
 }
 
-/// Returns `true` when the embedded IPv4 address has to be rewritten to
-/// hexadecimal digits: i.e. when it does **not** stand for a well-known
-/// IPv4/IPv6 transition prefix (RFC 5952 Section 5).
+/// Returns `true` when the last 32 bits of the address have to be rendered
+/// as a dotted IPv4 address (RFC 5952 Section 5).
 ///
-/// The prefix addresses keep their IPv4 text representation:
-///
-/// IPv4-compatible IPv6 address like "::1.2.3.4"
-///
-/// IPv4-mapped IPv6 address like "::ffff:1.2.3.4"
-///
-/// IPv4-translated address like "::ffff:0:1.2.3.4"
-///
-/// IPv4-translatable address like "64:ff9b::1.2.3.4"
-///
-/// ISATAP address like "fe80::5efe:1.2.3.4"
-fn ipv4_addr_rewrite(tks: &Ipv6AddrTokens) -> bool {
-    if !matches!(tks.last(), Some(Ipv6AddrToken::Ipv4Addr(_))) {
-        return false;
-    }
-    let itks = &tks[..tks.len() - 1];
-    let is_transition_prefix = matches!(itks, [Ipv6AddrToken::DoubleColon])
-        || matches!(
-            itks,
-            [Ipv6AddrToken::DoubleColon, Ipv6AddrToken::SixteenBit(s), Ipv6AddrToken::Colon]
-                if s == "ffff"
-        )
-        || matches!(
-            itks,
-            [
-                Ipv6AddrToken::DoubleColon,
-                Ipv6AddrToken::SixteenBit(s),
-                Ipv6AddrToken::Colon,
-                Ipv6AddrToken::AllZeros,
-                Ipv6AddrToken::Colon,
-            ] if s == "ffff"
-        )
-        || matches!(
-            itks,
-            [
-                Ipv6AddrToken::SixteenBit(a),
-                Ipv6AddrToken::Colon,
-                Ipv6AddrToken::SixteenBit(b),
-                Ipv6AddrToken::DoubleColon,
-            ] if a == "64" && b == "ff9b"
-        )
-        || is_isatap_suffix(itks);
-    !is_transition_prefix
+/// The IPv4 text representation is kept for the IPv4-mapped,
+/// IPv4-compatible, IPv4-translated, IPv4-translatable and ISATAP address
+/// classes. The unspecified and loopback addresses are not IPv4-compatible
+/// addresses, so they keep their pure IPv6 representation.
+fn keeps_ipv4_tail(segments: &[u16; 8]) -> bool {
+    let mapped = segments[..5].iter().all(|&s| s == 0) && segments[5] == 0xffff;
+    let translated =
+        segments[..4].iter().all(|&s| s == 0) && segments[4] == 0xffff && segments[5] == 0;
+    let translatable =
+        segments[0] == 0x64 && segments[1] == 0xff9b && segments[2..6].iter().all(|&s| s == 0);
+    let isatap = segments[5] == 0x5efe && matches!(segments[4], 0 | 0x0200);
+    let compatible =
+        segments[..6].iter().all(|&s| s == 0) && !(segments[6] == 0 && segments[7] <= 1);
+    mapped || translated || translatable || isatap || compatible
 }
 
-/// Returns `true` when the token list ends with one of the ISATAP
-/// suffixes "[200:5efe:]", "[0:5efe:]" or "[::5efe:]".
-fn is_isatap_suffix(itks: &[Ipv6AddrToken]) -> bool {
-    let l = itks.len();
-    (l >= 4
-        && matches!(
-            &itks[l - 4..],
-            [
-                Ipv6AddrToken::SixteenBit(a),
-                Ipv6AddrToken::Colon,
-                Ipv6AddrToken::SixteenBit(b),
-                Ipv6AddrToken::Colon,
-            ] if a == "200" && b == "5efe"
-        ))
-        || (l >= 4
-            && matches!(
-                &itks[l - 4..],
-                [
-                    Ipv6AddrToken::AllZeros,
-                    Ipv6AddrToken::Colon,
-                    Ipv6AddrToken::SixteenBit(b),
-                    Ipv6AddrToken::Colon,
-                ] if b == "5efe"
-            ))
-        || (l >= 3
-            && matches!(
-                &itks[l - 3..],
-                [
-                    Ipv6AddrToken::DoubleColon,
-                    Ipv6AddrToken::SixteenBit(b),
-                    Ipv6AddrToken::Colon,
-                ] if b == "5efe"
-            ))
+/// Builds the token list of the RFC 5952 text representation of an address
+/// given by its eight 16-Bit chunks.
+///
+/// The token list is not compressed: it is meant to be passed to
+/// [`to_double_colon`].
+fn segments_to_ipv6_addr_tokens(segments: &[u16; 8]) -> Ipv6AddrTokens {
+    if keeps_ipv4_tail(segments) {
+        mixed_tokens(segments)
+    } else {
+        pure_tokens(segments)
+    }
+}
+
+/// Builds the token list of the eight 16-Bit chunks of an address.
+fn pure_tokens(segments: &[u16; 8]) -> Ipv6AddrTokens {
+    let mut tks = Ipv6AddrTokens::new();
+    for (index, &segment) in segments.iter().enumerate() {
+        if index > 0 {
+            tks.push(Ipv6AddrToken::Colon);
+        }
+        tks.push(hex_chunk_token(segment));
+    }
+    tks
+}
+
+/// Builds the token list of the six leading 16-Bit chunks of an address,
+/// followed by its last 32 bits in dotted IPv4 notation.
+fn mixed_tokens(segments: &[u16; 8]) -> Ipv6AddrTokens {
+    let mut tks = Ipv6AddrTokens::new();
+    for (index, &segment) in segments[..6].iter().enumerate() {
+        if index > 0 {
+            tks.push(Ipv6AddrToken::Colon);
+        }
+        tks.push(hex_chunk_token(segment));
+    }
+    tks.push(Ipv6AddrToken::Colon);
+    tks.push(format_ipv4_tail(segments[6], segments[7]));
+    tks
+}
+
+/// Builds the dotted IPv4 token of the last 32 bits of an address.
+fn format_ipv4_tail(high: u16, low: u16) -> Ipv6AddrToken {
+    let bytes = [(high >> 8) as u8, high as u8, (low >> 8) as u8, low as u8];
+    let mut text = String::with_capacity(15);
+    for (index, &byte) in bytes.iter().enumerate() {
+        if index > 0 {
+            text.push('.');
+        }
+        push_decimal(&mut text, byte);
+    }
+    Ipv6AddrToken::Ipv4Addr(text)
+}
+
+/// Canonizes a valid token list in conformation with RFC 5952.
+///
+/// An embedded IPv4 address is first resolved to its two 16-Bit chunks, so
+/// that the address class can be determined from the eight chunks. The text
+/// representation of the last 32 bits then depends on that class, not on
+/// the input form.
+pub(crate) fn canonize_valid_tokens(tks: Ipv6AddrTokens) -> Option<Ipv6AddrTokens> {
+    let pure = rewrite_ipv4_tail(tks)?;
+    let segments = tokens_to_ipv6(pure)?.segments();
+    Some(to_double_colon(segments_to_ipv6_addr_tokens(&segments)))
+}
+
+/// Returns the RFC 5952 text representation of an address given by its
+/// eight 16-Bit chunks.
+pub(crate) fn ipv6_addr_from_segments(segments: [u16; 8]) -> Ipv6Addr {
+    let tks = to_double_colon(segments_to_ipv6_addr_tokens(&segments));
+    Ipv6Addr::from(ipv6_tokens_to_text(&tks))
 }
 
 /// Rewrites an embedded IPv4 address into the corresponding list of pure
 /// IPv6 address tokens.
 ///
 /// An IPv4 address `a.b.c.d` becomes the two 16-Bit chunks
-/// `SixteenBit(hex(a) <> pad(hex(b)))` and
-/// `SixteenBit(hex(c) <> pad(hex(d)))`, separated by a colon.
-pub(crate) fn ipv4_addr_to_ipv6_addr_tokens(t: &Ipv6AddrToken) -> Ipv6AddrTokens {
+/// `(a << 8) | b` and `(c << 8) | d`, separated by a colon and canonized
+/// without leading zeroes.
+pub(crate) fn ipv4_addr_to_ipv6_addr_tokens(t: Ipv6AddrToken) -> Ipv6AddrTokens {
     match t {
-        Ipv6AddrToken::Ipv4Addr(a) => {
+        Ipv6AddrToken::Ipv4Addr(text) => {
             let mut out = Ipv6AddrTokens::new();
-            let mut groups = a.split('.');
-            let n0 = hex_digits_of(groups.next());
-            let n1 = hex_digits_of(groups.next());
-            let n2 = hex_digits_of(groups.next());
-            let n3 = hex_digits_of(groups.next());
-            out.push(valid_sixteen_bit(n0 + &add_zero(&n1)));
-            out.push(Ipv6AddrToken::Colon);
-            out.push(valid_sixteen_bit(n2 + &add_zero(&n3)));
+            if let Some([a, b, c, d]) = ipv4_octets(&text) {
+                out.push(hex_chunk_token(u16::from(a) << 8 | u16::from(b)));
+                out.push(Ipv6AddrToken::Colon);
+                out.push(hex_chunk_token(u16::from(c) << 8 | u16::from(d)));
+            }
             out
         }
         other => {
             let mut out = Ipv6AddrTokens::new();
-            out.push(other.clone());
+            out.push(other);
             out
         }
     }
 }
 
-/// Returns the lowercase hexadecimal digits of a decimal IPv4 address group.
-fn hex_digits_of(group: Option<&str>) -> String {
-    match group.and_then(|g| g.parse::<u8>().ok()) {
-        Some(n) => format!("{n:x}"),
-        None => String::new(),
+/// Parses the four decimal octets of a canonized dotted IPv4 address.
+fn ipv4_octets(text: &str) -> Option<[u8; 4]> {
+    let mut parts = text.split('.');
+    let mut octets = [0u8; 4];
+    for octet in &mut octets {
+        *octet = parts.next()?.parse().ok()?;
     }
+    if parts.next().is_some() {
+        return None;
+    }
+    Some(octets)
 }
 
-/// Left-pads a single hexadecimal digit with a `0`.
-fn add_zero(d: &str) -> String {
-    if d.len() == 1 {
-        format!("0{d}")
+/// Builds the canonical token of a 16-Bit chunk value.
+fn hex_chunk_token(value: u16) -> Ipv6AddrToken {
+    if value == 0 {
+        Ipv6AddrToken::AllZeros
     } else {
-        d.to_owned()
+        valid_sixteen_bit(format!("{value:x}"))
     }
 }
 
 /// Expands the tokens of an IPv6 address to their full
 /// 4-hexadecimal-digit form.
-pub(crate) fn expand_tokens(tks: &Ipv6AddrTokens) -> Ipv6AddrTokens {
-    tks.iter()
-        .map(|t| match t {
-            Ipv6AddrToken::SixteenBit(s) => valid_sixteen_bit(pad_left_4(s)),
+pub(crate) fn expand_tokens(tks: Ipv6AddrTokens) -> Ipv6AddrTokens {
+    tks.into_iter()
+        .map(|token| match token {
+            Ipv6AddrToken::SixteenBit(s) => {
+                if s.len() == 4 {
+                    Ipv6AddrToken::SixteenBit(s)
+                } else {
+                    valid_sixteen_bit(pad_left_4(&s))
+                }
+            }
             Ipv6AddrToken::AllZeros => valid_sixteen_bit("0000"),
-            other => other.clone(),
+            other => other,
         })
         .collect()
 }
@@ -409,38 +416,61 @@ fn pad_left_4(s: &str) -> String {
 
 /// Replaces the unique double-colon token by the corresponding number of
 /// all-zero chunks.
-pub(crate) fn from_double_colon(tks: &Ipv6AddrTokens) -> Ipv6AddrTokens {
-    let dc_index = match tks
-        .iter()
-        .position(|t| matches!(t, Ipv6AddrToken::DoubleColon))
-    {
-        Some(i) => i,
-        None => return tks.clone(),
+pub(crate) fn from_double_colon(tks: Ipv6AddrTokens) -> Ipv6AddrTokens {
+    let mut dc_index = None;
+    let mut ipv4_addrs = 0usize;
+    let mut filled = 0usize;
+    for (index, token) in tks.iter().enumerate() {
+        match token {
+            Ipv6AddrToken::DoubleColon => {
+                if dc_index.is_none() {
+                    dc_index = Some(index);
+                }
+            }
+            Ipv6AddrToken::Colon => {}
+            Ipv6AddrToken::Ipv4Addr(_) => {
+                ipv4_addrs += 1;
+                filled += 1;
+            }
+            _ => filled += 1,
+        }
+    }
+    let Some(dc_index) = dc_index else {
+        return tks;
     };
-    let fsts = &tks[..dc_index];
-    let snds = &tks[dc_index + 1..];
+
+    // An embedded IPv4 token stands for two 16-Bit chunks, hence one less
+    // explicit token to fill.
+    let ntks = if ipv4_addrs == 1 { 7 } else { 8 };
+    // A valid token list never fills more than `ntks` chunks. Saturating keeps
+    // a malformed list from underflowing into a huge zero-chunk run.
+    debug_assert!(filled <= ntks);
+    let n = ntks.saturating_sub(filled);
 
     let mut out = Ipv6AddrTokens::new();
-    // fste = if null fsts then [] else fsts <> [Colon]
-    if !fsts.is_empty() {
-        out.extend(fsts.iter().cloned());
+    let mut tokens = tks.into_iter();
+    let mut firsts = 0usize;
+    for token in tokens.by_ref().take(dc_index) {
+        out.push(token);
+        firsts += 1;
+    }
+    let _double_colon = tokens.next();
+    if firsts > 0 {
         out.push(Ipv6AddrToken::Colon);
     }
-    // allZerosTokensReplacement: intersperse Colon (replicate n AllZeros)
-    let ntks = if count_ipv4_addr(tks) == 1 { 7 } else { 8 };
-    let filled = tks
-        .iter()
-        .filter(|t| !matches!(t, Ipv6AddrToken::DoubleColon | Ipv6AddrToken::Colon))
-        .count();
-    let n = ntks - filled;
-    out.extend(itertools::Itertools::intersperse(
-        std::iter::repeat_n(Ipv6AddrToken::AllZeros, n),
-        Ipv6AddrToken::Colon,
-    ));
-    // snde = if null snds then [] else Colon : snds
-    if !snds.is_empty() {
-        out.push(Ipv6AddrToken::Colon);
-        out.extend(snds.iter().cloned());
+    for index in 0..n {
+        if index > 0 {
+            out.push(Ipv6AddrToken::Colon);
+        }
+        out.push(Ipv6AddrToken::AllZeros);
+    }
+    let mut has_seconds = false;
+    for token in tokens {
+        if !has_seconds {
+            out.push(Ipv6AddrToken::Colon);
+            has_seconds = true;
+        }
+        out.push(token);
     }
     out
 }
@@ -451,51 +481,58 @@ pub(crate) fn from_double_colon(tks: &Ipv6AddrTokens) -> Ipv6AddrTokens {
 /// No replacement happens when there is no all-zero chunk, and
 /// "The symbol '::' MUST NOT be used to shorten just one 16-bit 0 field"
 /// (RFC 5952, 4.2.2) when the longest run is a single chunk.
-pub(crate) fn to_double_colon(tks: &Ipv6AddrTokens) -> Ipv6AddrTokens {
-    // Runs of consecutive equal tokens, ignoring colons.
-    let filtered: Vec<Ipv6AddrToken> = tks
+pub(crate) fn to_double_colon(tks: Ipv6AddrTokens) -> Ipv6AddrTokens {
+    // Find the first longest run of zero chunks, ignoring colons.
+    let mut best_start = 0usize;
+    let mut best_len = 0usize;
+    let mut run_start = 0usize;
+    let mut run_len = 0usize;
+    for (index, token) in tks
         .iter()
         .filter(|t| !matches!(t, Ipv6AddrToken::Colon))
-        .cloned()
-        .collect();
-    // Group by whether the token is an all-zero chunk or not: consecutive
-    // non-zero runs merge, but the (AllZeros, length) runs are preserved.
-    let runs: Vec<(bool, usize)> = filtered
-        .iter()
-        .chunk_by(|t| matches!(t, Ipv6AddrToken::AllZeros))
-        .into_iter()
-        .map(|(k, group)| (k, group.count()))
-        .collect();
-    // Longest all-zeros run length; the index of its first element in
-    // `filtered` is the sum of the lengths of the preceding runs.
-    let longest = runs
-        .iter()
-        .filter(|(k, _)| *k)
-        .map(|(_, l)| *l)
-        .max()
-        .unwrap_or(0);
-    let mut idx = 0usize;
-    let mut found = false;
-    for (k, l) in &runs {
-        if *k && *l == longest {
-            found = true;
-            break;
+        .enumerate()
+    {
+        if matches!(token, Ipv6AddrToken::AllZeros) {
+            if run_len == 0 {
+                run_start = index;
+            }
+            run_len += 1;
+            if run_len > best_len {
+                best_start = run_start;
+                best_len = run_len;
+            }
+        } else {
+            run_len = 0;
         }
-        idx += l;
     }
-    if !found || longest <= 1 {
-        return tks.clone();
+    if best_len <= 1 {
+        return tks;
     }
+
     let mut out = Ipv6AddrTokens::new();
-    out.extend(itertools::Itertools::intersperse(
-        filtered[..idx].iter().cloned(),
-        Ipv6AddrToken::Colon,
-    ));
+    let mut tokens = tks
+        .into_iter()
+        .filter(|token| !matches!(token, Ipv6AddrToken::Colon));
+    let mut has_prefix = false;
+    for token in tokens.by_ref().take(best_start) {
+        if has_prefix {
+            out.push(Ipv6AddrToken::Colon);
+        }
+        out.push(token);
+        has_prefix = true;
+    }
+    for _ in 0..best_len {
+        let _zero = tokens.next();
+    }
     out.push(Ipv6AddrToken::DoubleColon);
-    out.extend(itertools::Itertools::intersperse(
-        filtered[idx + longest..].iter().cloned(),
-        Ipv6AddrToken::Colon,
-    ));
+    let mut has_suffix = false;
+    for token in tokens {
+        if has_suffix {
+            out.push(Ipv6AddrToken::Colon);
+        }
+        out.push(token);
+        has_suffix = true;
+    }
     out
 }
 
@@ -522,23 +559,31 @@ fn hex_digit_to_int(c: u8) -> u16 {
 
 /// Converts pure IPv6 tokens (after `from_double_colon`) to a
 /// `std::net::Ipv6Addr`.
-pub(crate) fn tokens_to_ipv6(tks: &Ipv6AddrTokens) -> Option<std::net::Ipv6Addr> {
+pub(crate) fn tokens_to_ipv6(tks: Ipv6AddrTokens) -> Option<std::net::Ipv6Addr> {
     let expanded = from_double_colon(tks);
-    let chunks: SmallVec<[u16; 8]> = expanded
-        .iter()
-        .filter_map(|t| match t {
-            Ipv6AddrToken::SixteenBit(s) => Some(hex_text_to_int(s)),
-            Ipv6AddrToken::AllZeros => Some(0),
-            _ => None,
-        })
-        .collect();
-    if chunks.len() != 8 {
+    let mut segments = [0u16; 8];
+    let mut index = 0usize;
+    for token in &expanded {
+        match token {
+            Ipv6AddrToken::SixteenBit(text) => {
+                if index == segments.len() {
+                    return None;
+                }
+                segments[index] = hex_text_to_int(text);
+                index += 1;
+            }
+            Ipv6AddrToken::AllZeros => {
+                if index == segments.len() {
+                    return None;
+                }
+                index += 1;
+            }
+            _ => {}
+        }
+    }
+    if index != segments.len() {
         return None;
     }
-    let segments: [u16; 8] = match chunks.as_slice().try_into() {
-        Ok(s) => s,
-        Err(_) => return None,
-    };
     Some(std::net::Ipv6Addr::from(segments))
 }
 
@@ -549,7 +594,7 @@ pub(crate) fn tokens_to_ipv6(tks: &Ipv6AddrTokens) -> Option<std::net::Ipv6Addr>
 /// before the conversion.
 pub(crate) fn ipv6_addr_to_std(addr: &Ipv6Addr) -> Option<std::net::Ipv6Addr> {
     let tks = tok_pure_ipv6_addr(&addr.0)?;
-    tokens_to_ipv6(&tks)
+    tokens_to_ipv6(tks)
 }
 
 // NOTE: `networkInterfacesIPv6AddrList` (getting the IPv6 addresses of the
@@ -563,21 +608,40 @@ pub(crate) fn mac_addr(input: &str) -> Option<Ipv6AddrTokens> {
     if bytes.len() != 17 {
         return None;
     }
-    for (i, &b) in bytes.iter().enumerate() {
-        if i % 3 == 2 {
-            if b != b':' {
+    let mut chunks = [0u16; 3];
+    let mut chunk_index = 0usize;
+    let mut nibbles = 0usize;
+    let mut value = 0u16;
+    for (index, &byte) in bytes.iter().enumerate() {
+        if index % 3 == 2 {
+            if byte != b':' {
                 return None;
             }
-        } else if !is_hex_byte(b) {
+            continue;
+        }
+        if !is_hex_byte(byte) {
             return None;
         }
+        value = (value << 4) | hex_digit_to_int(byte);
+        nibbles += 1;
+        if nibbles == 4 {
+            if chunk_index >= chunks.len() {
+                return None;
+            }
+            chunks[chunk_index] = value;
+            chunk_index += 1;
+            nibbles = 0;
+            value = 0;
+        }
     }
-    let hex: String = bytes
-        .iter()
-        .filter(|&&b| b != b':')
-        .map(|&b| b.to_ascii_lowercase() as char)
-        .collect();
-    ipv6_addr_tokens(&hex)
+    if chunk_index != chunks.len() {
+        return None;
+    }
+    let mut out = Ipv6AddrTokens::new();
+    out.push(hex_chunk_token(chunks[0]));
+    out.push(hex_chunk_token(chunks[1]));
+    out.push(hex_chunk_token(chunks[2]));
+    Some(out)
 }
 
 /// Parses a 16-Bit chunk token: 1 to 4 hexadecimal digits.
@@ -627,8 +691,28 @@ fn parse_ipv4_addr(input: &str) -> Option<(Ipv6AddrToken, &str)> {
             idx += 1;
         }
     }
-    let text = groups.iter().map(u8::to_string).join(".");
+    let mut text = String::with_capacity(15);
+    for (index, &group) in groups.iter().enumerate() {
+        if index > 0 {
+            text.push('.');
+        }
+        push_decimal(&mut text, group);
+    }
     Some((Ipv6AddrToken::Ipv4Addr(text), &input[idx..]))
+}
+
+/// Appends the decimal representation of an octet to a string.
+fn push_decimal(out: &mut String, value: u8) {
+    if value >= 100 {
+        out.push((b'0' + value / 100) as char);
+        out.push((b'0' + (value / 10) % 10) as char);
+        out.push((b'0' + value % 10) as char);
+    } else if value >= 10 {
+        out.push((b'0' + value / 10) as char);
+        out.push((b'0' + value % 10) as char);
+    } else {
+        out.push((b'0' + value) as char);
+    }
 }
 
 /// Parses a `DoubleColon` token.
@@ -697,6 +781,11 @@ mod tests {
         assert!(is_ipv6_addr(&tks_of("::1:2:3:4:5:6:7")));
         assert!(is_ipv6_addr(&tks_of("::ffff:192.0.2.128")));
         assert!(is_ipv6_addr(&tks_of("64:ff9b::1.2.3.4")));
+        // An embedded IPv4 address stands for two 16-Bit chunks.
+        assert!(is_ipv6_addr(&tks_of("1:2:3:4:5:6:1.2.3.4")));
+        assert!(is_ipv6_addr(&tks_of("::1:2:3:4:5:1.2.3.4")));
+        assert!(is_ipv6_addr(&tks_of("::ffff:0:1.2.3.4")));
+        assert!(is_ipv6_addr(&tks_of("fe80::200:5efe:1.2.3.4")));
     }
 
     #[test]
@@ -709,6 +798,12 @@ mod tests {
         assert!(!is_ipv6_addr(&tks_of("1:2:3:4:5:6:7:8:9")));
         assert!(!is_ipv6_addr(&tks_of("::1:2:3:4:5:6:7:8")));
         assert!(!is_ipv6_addr(&tks_of("1.2.3.4")));
+        // The embedded IPv4 address must be separated by a colon.
+        assert!(!is_ipv6_addr(&tks_of("::ffff192.0.2.1")));
+        assert!(!is_ipv6_addr(&tks_of("::abcd1.2.3.4")));
+        assert!(!is_ipv6_addr(&tks_of("::123456.7.8.9")));
+        // "::" cannot stand for zero chunks.
+        assert!(!is_ipv6_addr(&tks_of("::1:2:3:4:5:6:1.2.3.4")));
     }
 
     #[test]
@@ -720,35 +815,41 @@ mod tests {
     }
 
     #[test]
+    fn ipv6_addr_is_invalid_when_chunks_are_adjacent_after_a_double_colon() {
+        // The tokenizer splits a long hexadecimal run into adjacent chunks.
+        assert!(!is_ipv6_addr(&tks_of("::12ab34cd")));
+        assert!(!is_ipv6_addr(&tks_of(
+            "::123412341234123412341234123412341234"
+        )));
+    }
+
+    #[test]
     fn from_double_colon_expands_the_double_colon() {
+        assert_eq!(text_of(&from_double_colon(tks_of("::"))), "0:0:0:0:0:0:0:0");
         assert_eq!(
-            text_of(&from_double_colon(&tks_of("::"))),
-            "0:0:0:0:0:0:0:0"
-        );
-        assert_eq!(
-            text_of(&from_double_colon(&tks_of("1::"))),
+            text_of(&from_double_colon(tks_of("1::"))),
             "1:0:0:0:0:0:0:0"
         );
         assert_eq!(
-            text_of(&from_double_colon(&tks_of("::ffff:192.0.2.128"))),
+            text_of(&from_double_colon(tks_of("::ffff:192.0.2.128"))),
             "0:0:0:0:0:ffff:192.0.2.128"
         );
         // No double colon: unchanged.
         let tks = tks_of("1:2:3:4:5:6:7:8");
-        assert_eq!(from_double_colon(&tks), tks);
+        assert_eq!(from_double_colon(tks.clone()), tks);
     }
 
     #[test]
     fn to_double_colon_compresses_long_zero_runs() {
         assert_eq!(
-            text_of(&to_double_colon(&from_double_colon(&tks_of("::")))),
+            text_of(&to_double_colon(from_double_colon(tks_of("::")))),
             "::"
         );
         let tks = tks_of("1:0:0:1");
-        assert_eq!(text_of(&to_double_colon(&tks_of("1:0:0:1"))), "1::1");
+        assert_eq!(text_of(&to_double_colon(tks_of("1:0:0:1"))), "1::1");
         // A single zero chunk must not be shortened by "::" (RFC 5952, 4.2.2).
         assert_eq!(text_of(&tks), "1:0:0:1");
-        assert_eq!(text_of(&to_double_colon(&tks_of("1:0:1"))), "1:0:1");
+        assert_eq!(text_of(&to_double_colon(tks_of("1:0:1"))), "1:0:1");
     }
 
     #[test]
@@ -761,7 +862,7 @@ mod tests {
             "64:ff9b::1.2.3.4",
         ] {
             let original = tks_of(text);
-            let round = to_double_colon(&from_double_colon(&original));
+            let round = to_double_colon(from_double_colon(original.clone()));
             assert_eq!(round, original, "round trip of {text}");
         }
     }
@@ -793,6 +894,45 @@ mod tests {
             text_of(&tok_ipv6_addr("1:2:3:4:5:6:192.0.2.1").expect("should parse")),
             "1:2:3:4:5:6:c000:201"
         );
+        // The representation depends on the address class, not on the
+        // input form: a pure hexadecimal mapped address gets a dotted tail.
+        assert_eq!(
+            text_of(&tok_ipv6_addr("::ffff:c000:201").expect("should parse")),
+            "::ffff:192.0.2.1"
+        );
+        // IPv4-compatible addresses get a dotted tail too.
+        assert_eq!(
+            text_of(&tok_ipv6_addr("::0.0.0.2").expect("should parse")),
+            "::0.0.0.2"
+        );
+        assert_eq!(
+            text_of(&tok_ipv6_addr("::2").expect("should parse")),
+            "::0.0.0.2"
+        );
+        // The unspecified and loopback addresses are not IPv4-compatible.
+        assert_eq!(
+            text_of(&tok_ipv6_addr("::0.0.0.1").expect("should parse")),
+            "::1"
+        );
+        assert_eq!(
+            text_of(&tok_ipv6_addr("::0.0.0.0").expect("should parse")),
+            "::"
+        );
+        // The IPv4-mapped zero address keeps a dotted tail.
+        assert_eq!(
+            text_of(&tok_ipv6_addr("::ffff:0:0").expect("should parse")),
+            "::ffff:0.0.0.0"
+        );
+        // IPv4-translated address.
+        assert_eq!(
+            text_of(&tok_ipv6_addr("::ffff:0:1.2.3.4").expect("should parse")),
+            "::ffff:0:1.2.3.4"
+        );
+        // ISATAP address with the 0200:5efe interface identifier.
+        assert_eq!(
+            text_of(&tok_ipv6_addr("fe80::200:5efe:192.0.2.1").expect("should parse")),
+            "fe80::200:5efe:192.0.2.1"
+        );
     }
 
     #[test]
@@ -814,6 +954,24 @@ mod tests {
     }
 
     #[test]
+    fn ipv6_addr_from_segments_renders_the_rfc_5952_text() {
+        assert_eq!(
+            ipv6_addr_from_segments([0x2001, 0xdb8, 0, 0, 0, 0, 0, 1]).0,
+            "2001:db8::1"
+        );
+        assert_eq!(
+            ipv6_addr_from_segments([0, 0, 0, 0, 0, 0, 0, 2]).0,
+            "::0.0.0.2"
+        );
+        assert_eq!(
+            ipv6_addr_from_segments([0, 0, 0, 0, 0, 0xffff, 0xc000, 0x0201]).0,
+            "::ffff:192.0.2.1"
+        );
+        assert_eq!(ipv6_addr_from_segments([0; 8]).0, "::");
+        assert_eq!(ipv6_addr_from_segments([0, 0, 0, 0, 0, 0, 0, 1]).0, "::1");
+    }
+
+    #[test]
     fn tok_pure_ipv6_addr_always_rewrites_the_ipv4_address() {
         // "::ffff:192.0.2.128" == "::ffff:c000:280"
         let tks = tok_pure_ipv6_addr("::ffff:192.0.2.128").expect("should parse");
@@ -826,25 +984,24 @@ mod tests {
     fn full_expansion_pads_all_chunks_to_four_digits() {
         // "0000:0000:0000:0000:0000:ffff:c000:0280"
         let tks = tok_pure_ipv6_addr("::ffff:192.0.2.128").expect("should parse");
-        let tks = from_double_colon(&tks);
-        let tks = expand_tokens(&tks);
+        let tks = from_double_colon(tks);
+        let tks = expand_tokens(tks);
         assert_eq!(text_of(&tks), "0000:0000:0000:0000:0000:ffff:c000:0280");
     }
 
     #[test]
-    fn ipv4_addr_is_rewritten_to_two_sixteen_bit_chunks() {
-        let out =
-            ipv4_addr_to_ipv6_addr_tokens(&Ipv6AddrToken::Ipv4Addr(String::from("127.0.0.1")));
+    fn ipv4_addr_is_rewritten_to_two_canonical_sixteen_bit_chunks() {
+        let out = ipv4_addr_to_ipv6_addr_tokens(Ipv6AddrToken::Ipv4Addr(String::from("127.0.0.1")));
         assert_eq!(
             out.as_slice(),
             [
                 Ipv6AddrToken::SixteenBit(String::from("7f00")),
                 Ipv6AddrToken::Colon,
-                Ipv6AddrToken::SixteenBit(String::from("001")),
+                Ipv6AddrToken::SixteenBit(String::from("1")),
             ]
         );
         let out =
-            ipv4_addr_to_ipv6_addr_tokens(&Ipv6AddrToken::Ipv4Addr(String::from("192.0.2.128")));
+            ipv4_addr_to_ipv6_addr_tokens(Ipv6AddrToken::Ipv4Addr(String::from("192.0.2.128")));
         assert_eq!(
             out.as_slice(),
             [
@@ -852,6 +1009,42 @@ mod tests {
                 Ipv6AddrToken::Colon,
                 Ipv6AddrToken::SixteenBit(String::from("280")),
             ]
+        );
+        // Zero high bytes must not leave leading zeroes behind.
+        let out = ipv4_addr_to_ipv6_addr_tokens(Ipv6AddrToken::Ipv4Addr(String::from("0.0.0.0")));
+        assert_eq!(
+            out.as_slice(),
+            [
+                Ipv6AddrToken::AllZeros,
+                Ipv6AddrToken::Colon,
+                Ipv6AddrToken::AllZeros
+            ]
+        );
+        let out =
+            ipv4_addr_to_ipv6_addr_tokens(Ipv6AddrToken::Ipv4Addr(String::from("61.62.63.64")));
+        assert_eq!(
+            out.as_slice(),
+            [
+                Ipv6AddrToken::SixteenBit(String::from("3d3e")),
+                Ipv6AddrToken::Colon,
+                Ipv6AddrToken::SixteenBit(String::from("3f40")),
+            ]
+        );
+    }
+
+    #[test]
+    fn tok_ipv6_addr_recompresses_after_rewriting_the_ipv4_tail() {
+        assert_eq!(
+            text_of(&tok_ipv6_addr("1:2:3:4:5:6:0.0.0.0").expect("should parse")),
+            "1:2:3:4:5:6::"
+        );
+        assert_eq!(
+            text_of(&tok_ipv6_addr("1::0.0.0.1").expect("should parse")),
+            "1::1"
+        );
+        assert_eq!(
+            text_of(&tok_pure_ipv6_addr("1::0.0.0.1").expect("should parse")),
+            "1::1"
         );
     }
 
@@ -961,7 +1154,7 @@ mod tests {
     #[test]
     fn tokens_to_ipv6_builds_the_net_ipv6_addr() {
         let tks = tok_pure_ipv6_addr("::ffff:192.0.2.128").expect("should parse");
-        let addr = tokens_to_ipv6(&tks).expect("should convert");
+        let addr = tokens_to_ipv6(tks).expect("should convert");
         assert_eq!(
             addr,
             std::net::Ipv6Addr::from([0, 0, 0, 0, 0, 0xffff, 0xc000, 0x0280])

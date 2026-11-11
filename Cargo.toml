@@ -13,5 +13,4 @@ readme = "README.md"
 rust-version = "1.85.1"
 
 [dependencies]
-itertools = "0.15.0"
 smallvec = "1.16.1"

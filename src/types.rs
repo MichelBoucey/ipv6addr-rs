@@ -20,9 +20,11 @@ pub struct Ipv6Addr(pub String);
 /// texts are then compared, so that the equality relation stays reflexive.
 impl PartialEq for Ipv6Addr {
     fn eq(&self, other: &Self) -> bool {
+        if self.0 == other.0 {
+            return true;
+        }
         let canonical = |text: &str| {
-            crate::internals::tok_pure_ipv6_addr(text)
-                .and_then(|tks| crate::internals::tokens_to_ipv6(&tks))
+            crate::internals::tok_pure_ipv6_addr(text).and_then(crate::internals::tokens_to_ipv6)
         };
         match (canonical(&self.0), canonical(&other.0)) {
             (Some(a), Some(b)) => a == b,
@@ -36,7 +38,7 @@ impl Eq for Ipv6Addr {}
 impl Display for Ipv6Addr {
     /// Renders the wrapped text as-is.
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.0)
+        f.write_str(&self.0)
     }
 }
 
@@ -55,14 +57,14 @@ impl From<&str> for Ipv6Addr {
 /// Converts a `std::net::Ipv6Addr` into its canonical text representation
 /// (RFC 5952).
 ///
-/// The IPv4-mapped addresses keep their IPv4 text representation, as
-/// `std::net::Ipv6Addr` renders them:
+/// The last 32 bits are rendered as a dotted IPv4 address for the
+/// well-known IPv4/IPv6 transition prefixes (RFC 5952 Section 5):
 ///
 /// > Ipv6Addr::from(std::net::Ipv6Addr::new(0, 0, 0, 0, 0, 0xffff, 0xc000, 0x0280))
 /// >   == Ipv6Addr("::ffff:192.0.2.128")
 impl From<std::net::Ipv6Addr> for Ipv6Addr {
     fn from(addr: std::net::Ipv6Addr) -> Self {
-        Ipv6Addr(addr.to_string())
+        crate::internals::ipv6_addr_from_segments(addr.segments())
     }
 }
 
@@ -81,7 +83,7 @@ impl From<std::net::Ipv6Addr> for Ipv6Addr {
 /// without panicking.
 impl From<Ipv6Addr> for std::net::Ipv6Addr {
     fn from(addr: Ipv6Addr) -> Self {
-        match crate::internals::ipv6_addr_to_std(&addr) {
+        match crate::to_std_ipv6_addr(&addr) {
             Some(net_addr) => net_addr,
             None => panic!("{addr} is not a valid IPv6 address"),
         }
@@ -178,6 +180,22 @@ mod tests {
         assert_eq!(
             Ipv6Addr::from(std::net::Ipv6Addr::LOCALHOST),
             Ipv6Addr::from("::1")
+        );
+        assert_eq!(Ipv6Addr::from(std::net::Ipv6Addr::UNSPECIFIED).0, "::");
+        assert_eq!(Ipv6Addr::from(std::net::Ipv6Addr::LOCALHOST).0, "::1");
+        // An IPv4-compatible address gets a dotted tail.
+        assert_eq!(
+            Ipv6Addr::from(std::net::Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 2)).0,
+            "::0.0.0.2"
+        );
+        // An IPv4-mapped zero address gets a dotted tail.
+        assert_eq!(
+            Ipv6Addr::from(std::net::Ipv6Addr::new(0, 0, 0, 0, 0, 0xffff, 0, 0)).0,
+            "::ffff:0.0.0.0"
+        );
+        assert_eq!(
+            Ipv6Addr::from(std::net::Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)).0,
+            "2001:db8::1"
         );
     }
 
