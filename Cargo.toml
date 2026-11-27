@@ -7,7 +7,6 @@ license = "BSD-3-Clause"
 categories = ["network-programming","command-line-utilities"]
 keywords = ["network","ipv6", "cli"]
 description = "A library to deal with IPv6 address text representations, canonization and manipulations."
-homepage = "https://github.com/MichelBoucey/ipv6addr-rs"
 repository = "https://github.com/MichelBoucey/ipv6addr-rs"
 readme = "README.md"
 rust-version = "1.85.1"
